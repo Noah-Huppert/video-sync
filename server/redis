@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+sudo podman run -it --rm --net host redis:latest
