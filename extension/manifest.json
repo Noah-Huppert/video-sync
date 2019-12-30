@@ -1,16 +1,15 @@
 {
-  "manifest_version": 2,
-  "name": "Video Sync",
-  "version": "1.0",
-  "description": "Sync video between friends",
-  "icons": {
-    "48": "icon48.png"
-  },
-  "content_scripts": [
-    {
-      "matches": ["*://*.netflix.com/*"],
-      "js": ["main.js"]
-    }
-  ]
-
+    "manifest_version": 2,
+    "name": "Video Sync",
+    "version": "1.0",
+    "description": "Sync video between friends",
+    "icons": {
+	   "48": "icon48.png"
+    },
+    "content_scripts": [
+	   {
+		  "matches": ["*://*.netflix.com/*"],
+		  "js": ["main.js"]
+	   }
+    ],
 }
