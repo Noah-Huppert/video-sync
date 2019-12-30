@@ -209,6 +209,9 @@ func (h healthHdlr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //    - create-session: Request to create a sync session, see wsCreateSessMsg
 //                      for required message fields, the server will respond
 //                      with a hereis-session message.
+//    - get-session: Request a session by ID, see wsGetSessMsg for required
+//                   fields, the server will respond with a
+//                   hereis-session message.
 //    - report-state: Provides server with information about the client's
 //                    current video player state, see wsReportStateMsg for
 //                    required message fields
@@ -249,6 +252,7 @@ const (
 	wsReportStateMsgT        = "report-state"
 	wsCmdStateMsgT           = "command-state"
 	wsChangeStateMsgT        = "change-state"
+	wsGetSessMsgT            = "get-session"
 )
 
 // wsErrMsg is an error message which could be sent via a web socket
@@ -281,6 +285,23 @@ func newWsCreateSessMsg() wsCreateSessMsg {
 	return wsCreateSessMsg{
 		wsMsg: wsMsg{
 			Type: wsCreateSessMsgT,
+		},
+	}
+}
+
+// wsGetSessMsg contains details about which session the client wants
+type wsGetSessMsg struct {
+	wsMsg
+
+	// SessionID is the session to client wants
+	SessionID string `json:"session_id" validate:"required"`
+}
+
+// newWsGetSessMsg initializes a new wsGetSessMsg
+func newWsGetSessMsg() wsGetSessMsg {
+	return wsGetSessMsg{
+		wsMsg: wsMsg{
+			Type: wsGetSessMsgT,
 		},
 	}
 }
