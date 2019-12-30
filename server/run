@@ -1,2 +1,4 @@
 #!/usr/bin/env bash
+prog_dir=$(realpath $(dirname "$0"))
+cd "$prog_dir"
 go run . "$@"
