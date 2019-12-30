@@ -1,2 +1,38 @@
 #!/usr/bin/env bash
-sudo podman run -it --rm --net host redis:latest
+# $1 = command to run, commands:
+# - start: start Redis container
+# - status: get status of container, outputs "running" if Redis server is running,
+#           "stopped" if the Redis container is stopped but still exists, and
+#           "not found" if the Redis container does not exist.
+container_cli="sudo podman"
+container_name=dev-video-sync-redis
+
+case "$1" in
+    start)
+	   $container_cli run --name "$container_name" -d --net host redis:latest
+	   ;;
+    status)
+	   if $container_cli ps | grep "$container_name" &> /dev/null; then
+		  echo "running"
+	   elif $container_cli ps -a | grep "$container_name" &> /dev/null; then
+		  echo "stopped"
+	   else
+		  echo "not found"
+	   fi
+	   ;;
+    stop)
+	   case $($0 status) in
+		  running)
+			 $container_cli stop "$container_name"
+			 $container_cli rm "$container_name"
+			 ;;
+		  stopped)
+			 $container_cli rm "$container_name"
+			 ;;
+	   esac
+	   ;;
+    *)
+	   echo "first argument must be \"start\" or \"stop\"" >&2
+	   exit 1
+	   ;;
+esac

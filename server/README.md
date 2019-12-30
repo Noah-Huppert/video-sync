@@ -17,7 +17,7 @@ Podman is used for local development.
 First run a local Redis server:
 
 ```
-./redis
+./redis start
 ```
 
 Then start the server:
@@ -27,3 +27,9 @@ Then start the server:
 ```
 
 Relaunch `./run` when changes to the code are made.
+
+Stop the Redis server when done:
+
+```
+./redis stop
+```
