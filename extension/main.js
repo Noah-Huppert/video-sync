@@ -35,32 +35,6 @@ if ("video-sync" in query) {
 var videoSyncID = localStorage.getItem("videoSyncID");
 var videoSyncAPIHost = localStorage.getItem("videoSyncAPIHost") || "localhost:5000";
 
-console.log("videoSyncID", videoSyncID, videoSyncAPIHost);
-
-// Create video sync session if none specified
-if (videoSyncID == null) {
-    console.log("post /sync commented out");
-    /*
-    fetch("http://" + videoSyncAPIHost + "/sync", {
-	   method: "POST",
-	   headers: {
-		  "Content-Type": "application/json"
-	   }
-    }).then(function(resp) {
-	   if (!resp.ok) {
-		  console.error("failed to create new sync session: " +
-					 resp["error"]);
-	   } else {
-		  console.log("sync session: ", resp);
-		  localStorage.setItem("videoSyncID", resp["sync_session"]["id"]);
-		  videoSyncID = resp["sync_session"]["id"];
-	   }
-    }).catch(function(err) {
-	   console.error("failed to create sync session", err);
-    });
-*/
-}
-
 // Create a websocket to recieve sync session commands
 var syncWS = new WebSocket("ws://" + videoSyncAPIHost + "/sync");
 var syncWSReady = false;
@@ -93,7 +67,12 @@ var mountCheckInt = setInterval(function() {
 
 // Called when video element loads
 function onMounted(video) {
-    syncWS.send("{\"type\": \"create-session\"}");
-    console.log("ct", video.currentTime);
-    //syncWS.send("hello world");
+    if (!videoSyncID) {
+	   syncWS.send("{\"type\": \"create-session\"}");
+    } else {
+	   syncWS.send(JSON.stringify({
+		  type: "get-session",
+		  session_id: videoSyncID,
+	   }));
+    }
 }
