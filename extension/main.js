@@ -63,22 +63,29 @@ if (videoSyncID == null) {
 
 // Create a websocket to recieve sync session commands
 var syncWS = new WebSocket("ws://" + videoSyncAPIHost + "/sync");
+var syncWSReady = false;
 
 syncWS.onopen = function() {
-    syncWS.send("hello currentTime=" + 0);
+    syncWSReady = true;
 };
 
 syncWS.onmessage = function(msg) {
     console.log("syncWS received", msg);
 };
 
-// Keep checking for video element while its loading in, called onMounted
-// when loaded.
+// Poll until video element loads and syncWS is open. onMounted is called when
+// all pre-conditions are met.
 var mountCheckInt = setInterval(function() {
+    // Check for videos
     var videos = document.getElementsByTagName("video");
     if (videos.length > 1) {
 	   console.error("found more than one video frame: " + videos.length);
-    } else if (videos.length == 1) {
+	   clearInterval(mountCheckInt);
+	   return;
+    }
+
+    // Call onMounted if pre-conditions are met
+    if (syncWSReady && videos.length == 1) {
 	   clearInterval(mountCheckInt);
 	   onMounted(videos[0]);
     }
@@ -86,6 +93,7 @@ var mountCheckInt = setInterval(function() {
 
 // Called when video element loads
 function onMounted(video) {
+    syncWS.send("{\"type\": \"create-session\"}");
     console.log("ct", video.currentTime);
     //syncWS.send("hello world");
 }
