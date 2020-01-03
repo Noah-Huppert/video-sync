@@ -7,9 +7,17 @@
 container_cli="sudo podman"
 container_name=dev-video-sync-redis
 
+function die() {
+    echo "redis: $@" >&2
+    exit 1
+}
+
 case "$1" in
     start)
-	   $container_cli run --name "$container_name" -d --net host redis:latest
+	   case $($0 status) in
+		  running) die "already running" ;;
+		  stopped) $container_cli start "$container_name" ;;
+	   esac
 	   ;;
     status)
 	   if $container_cli ps | grep "$container_name" &> /dev/null; then
@@ -32,7 +40,6 @@ case "$1" in
 	   esac
 	   ;;
     *)
-	   echo "first argument must be \"start\" or \"stop\"" >&2
-	   exit 1
+	   die "first argument must be \"start\", \"status\", \"stop\""
 	   ;;
 esac
