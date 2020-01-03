@@ -16,5 +16,5 @@ Non-ES6 JavaScript is used.
 
 Code is located in the [`main.js`](./main.js) file.
 
-Open `local-test.html` in the browser for quick development. Reload the page 
-when changes to `main.js` are made.
+Open `mock-viewer.html` in the browser for quick development. Reload the page 
+when changes to `common.js` or `viewer.js` are made.
