@@ -616,7 +616,7 @@ func main() {
 		baseHdlr: baseH,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
-				// TODO: Make this safe
+				// TODO: Make this perform security correct checks, see gorilla/websocket godocs
 				return true
 			},
 		},

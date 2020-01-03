@@ -47,6 +47,7 @@ class syncAPI {
 
 	   // Handle
 	   console.log("msg.type", msg.type, this.wsHereisSessMsgT);
+	   // TODO: this.wsHereisSessMsgT is undefined, find out why so msgs can be handled
 	   switch (msg.type) {
 	   case this.wsHereisSessMsgT:
 		  console.log("setting session");
