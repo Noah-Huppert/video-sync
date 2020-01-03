@@ -12,6 +12,9 @@ synchronize them.
 # Development
 Golang is used.
 
+A custom message protocol is used to communicate with the web extension client,
+see the `syncWS` struct docs for details.
+
 Podman is used for local development.
 
 First run a local Redis server:
