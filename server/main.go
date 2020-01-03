@@ -218,6 +218,8 @@ func (h healthHdlr) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //    - change-state: Modifies a sync session's state, causing all clients in
 //                    the session to update to this state, see wsChangeStateMsg
 //                    for required fields.
+//    - error: Indicates an error occurred on the client side, see wsErrMsg
+//             for message fields.
 //
 // Server->client message types:
 //
@@ -495,6 +497,9 @@ func (h syncWS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		h.log.Debugf("web socket received type=%s time=%s", msg.Type,
+			time.Now())
+
 		switch msg.Type {
 		case wsCreateSessMsgT:
 			// Parse msg as wsCreateSessMsg
@@ -542,6 +547,14 @@ func (h syncWS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Session = sess
 			h.wsJSON(ws, resp)
 			break
+		case wsErrMsgT:
+			var errMsg wsErrMsg
+			if !h.wsParseJSON(ws, msgBytes, &errMsg) {
+				continue
+			}
+
+			h.log.Errorf("client side error reported=%s", errMsg.Err)
+			break
 		default:
 			h.wsErr(ws, fmt.Errorf("message type \"%s\" is not valid",
 				msg.Type), nil)
@@ -565,6 +578,8 @@ func main() {
 	}()
 
 	// Config
+	log.Debugf("loading config")
+
 	cfgLdr := goconf.NewDefaultLoader()
 	cfgLdr.AddConfigPath("/etc/video-sync/*")
 	cfgLdr.AddConfigPath("./*")
@@ -574,6 +589,8 @@ func main() {
 	}
 
 	// Redis
+	log.Debugf("connecting to database")
+
 	redis := redislib.NewClient(&redislib.Options{
 		Addr:     cfg.RedisAddr,
 		Password: "", // no password set
@@ -585,6 +602,8 @@ func main() {
 	}
 
 	// HTTP server
+	log.Debugf("starting HTTP server")
+
 	baseH := baseHdlr{
 		ctx: ctx,
 		log: log,
@@ -613,7 +632,7 @@ func main() {
 
 	wg.Add(1)
 	go func() {
-		log.Infof("starting server on %s", server.Addr)
+		log.Infof("http listening on %s", server.Addr)
 
 		if err := server.ListenAndServe(); err != nil &&
 			err != http.ErrServerClosed {
