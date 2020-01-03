@@ -12,4 +12,9 @@
 		  "js": ["common.js", "viewer.js"]
 	   }
     ],
+    "sidebar_action": {
+	   "default_icon": "icon48.png",
+	   "default_title": "Video Sync",
+	   "default_panel": "panel.html"
+    }
 }
