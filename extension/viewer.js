@@ -33,7 +33,7 @@ if ("video-sync" in query) {
 
 // Get settings from storage
 var videoSyncID = localStorage.getItem("videoSyncID");
-var videoSyncAPIHost = localStorage.getItem("videoSyncAPIHost") || "localhost:5000";
+//var videoSyncAPIHost = localStorage.getItem("videoSyncAPIHost") || "localhost:5000";
 
 // Create a websocket to recieve sync session commands
 var syncWS = new WebSocket("ws://" + videoSyncAPIHost + "/sync");

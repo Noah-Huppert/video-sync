@@ -9,7 +9,7 @@
     "content_scripts": [
 	   {
 		  "matches": ["*://*.netflix.com/*"],
-		  "js": ["main.js"]
+		  "js": ["viewer.js"]
 	   }
     ],
 }
