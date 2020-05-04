@@ -13,5 +13,3 @@ syncClient.then(async (syncClient) => {
 browser.storage.onChanged.addListener(function(changes, areaName) {
     console.log("storage.local.onChanged, changes=", changes);
 });
-
-console.log("heelo");

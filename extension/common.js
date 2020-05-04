@@ -20,7 +20,7 @@ class syncAPI {
 			 }
 
 			 this.syncWS = this.newSyncWS();
-			 this.syncWS.addEventListener('message', this.onWSMsg);
+			 this.syncWS.addEventListener('message', this.onWSMsg.bind(this));
 
 			 return new Promise((resolve, reject) => {
 				this.syncWS.addEventListener('open', () => {
@@ -46,12 +46,10 @@ class syncAPI {
 	   }
 
 	   // Handle
-	   console.log("msg.type", msg.type, this.wsHereisSessMsgT);
-	   // TODO: this.wsHereisSessMsgT is undefined, find out why so msgs can be handled
 	   switch (msg.type) {
 	   case this.wsHereisSessMsgT:
-		  console.log("setting session");
-		  setSyncSess(msg.session)
+		  console.log("setting session", msg.session);
+		  this.setSyncSess(msg.session)
 			 .then(() => {
 				console.log("set sess");
 			 })
@@ -100,7 +98,14 @@ class syncAPI {
 	* Returns the current sync session, or null if none exists.
 	*/
     getSyncSess() {
-	   return browser.storage.local.get("sync_session");
+	   return browser.storage.local.get("sync_session")
+		  .then((jsonStr) => {
+			 if (typeof(jsonStr) == "string") {
+				return Promise.resolve(JSON.parse(jsonStr));
+			 }
+
+			 return Promise.resolve(jsonStr);
+		  });
     }
 
 
@@ -108,7 +113,7 @@ class syncAPI {
 	* Sets current sync session.
 	*/
     setSyncSess(sess) {
-	   return browser.storage.local.set("sync_session", sess);
+	   return browser.storage.local.set("sync_session", JSON.stringify(sess));
     }
 
     /**
