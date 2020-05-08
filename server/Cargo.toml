@@ -4,6 +4,12 @@ version = "0.1.0"
 authors = ["Noah Huppert <contact@noahh.io>"]
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+actix-rt = "1.0"
+actix-web = "2.0"
+redis = "0.15.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3.4"
+log = "0.4.8"
+env_logger = "0.7.1"

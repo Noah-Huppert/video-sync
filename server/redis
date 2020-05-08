@@ -6,6 +6,7 @@
 #           "not found" if the Redis container does not exist.
 container_cli="sudo podman"
 container_name=dev-video-sync-redis
+container_tag="redis:latest"
 
 function die() {
     echo "redis: $@" >&2
@@ -17,6 +18,7 @@ case "$1" in
 	   case $($0 status) in
 		  running) die "already running" ;;
 		  stopped) $container_cli start "$container_name" ;;
+		  "not found") $container_cli run -d --net host --name "$container_name" "$container_tag" ;;
 	   esac
 	   ;;
     status)
