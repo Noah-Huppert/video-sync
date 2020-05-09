@@ -158,6 +158,7 @@ async fn create_sync_session(
     })
 }
 
+/// Default handler when no registered routes match a request.
 async fn not_found(req: HttpRequest) -> impl Responder {
     HttpResponse::NotFound().json(
         ErrorResp::new("Not found", &format!("{} does not exist", req.path())))
