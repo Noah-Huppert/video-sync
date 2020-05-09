@@ -39,9 +39,18 @@ case "$1" in
 		  stopped)
 			 $container_cli rm "$container_name"
 			 ;;
+		  *) die "Cannot stop and remove redis if not running" ;;
+	   esac
+	   ;;
+    logs)
+	   case $($0 status) in
+		  running)
+			 $container_cli logs -f "$container_name"
+			 ;;
+		  *) die "Cannot get logs if Redis is not running" ;;
 	   esac
 	   ;;
     *)
-	   die "first argument must be \"start\", \"status\", \"stop\""
+	   die "first argument must be \"start\", \"status\", \"stop\", \"logs\""
 	   ;;
 esac
