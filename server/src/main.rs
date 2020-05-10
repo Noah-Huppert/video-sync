@@ -1,17 +1,17 @@
+#[macro_use] extern crate serde;
+use serde_json;
 use serde::{Serialize,Deserialize};
 use serde::de::DeserializeOwned;
-use serde_json;
 use actix_web::{HttpServer,App,web,Responder,HttpRequest,HttpResponse};
 use actix_web::middleware::Logger;
-use futures::prelude::*;
-use redis::{RedisResult,AsyncCommands,RedisError};
+use redis::{RedisResult,AsyncCommands};
 use redis::aio::MultiplexedConnection;
 #[macro_use] extern crate log;
 use env_logger::Env;
 use uuid::Uuid;
-use chrono::{DateTime,Utc};
+use chrono::Utc;
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// HTTP app state.
@@ -25,14 +25,14 @@ trait RedisKey {
     fn key(&self) -> String;
 }
 
-/// Store item as JSON in Redis
+/// Store item as JSON in Redis.
 async fn store_in_redis<T: Serialize + RedisKey>(
     redis_conn: &mut MultiplexedConnection,
     data: &T
 ) -> Result<(), String>
 {
-    let data_json = match serde_json::to_string(&data) {
-        Err(e) => return Err(format!("Failed to serialize data: {}", e)),
+    let data_json = match serde_json::to_string(data) {
+        Err(e) => return Err(format!("Failed to serialize data as JSON: {}", e)),
         Ok(v) => v,
     };
 
@@ -42,6 +42,85 @@ async fn store_in_redis<T: Serialize + RedisKey>(
     };
 
     Ok(())
+}
+
+/// Holds context required to setup multiple set commands on a Redis pipeline.
+struct RedisStoreMany<'a> {
+    /// Pipeline used to execute the multi set operation.
+    redis_pipeline: &'a mut redis::Pipeline,
+
+    /// Data to store. Keys = Redis key, values = JSON
+    data: HashMap<String, String>,
+
+    /// Errors which occured during serialization in the store() method.
+    /// Keys = Redis key, values = error strings.
+    serialization_errors: HashMap<String, String>,
+}
+
+impl <'a> RedisStoreMany<'a> {
+    /// Creates a new RedisStoreMany structure.
+    fn new(redis_pipeline: &'a mut redis::Pipeline) -> RedisStoreMany {
+        RedisStoreMany{
+            redis_pipeline: redis_pipeline,
+            data: HashMap::new(),
+            serialization_errors: HashMap::new(),
+        }
+    }
+
+    /// Add item to be stored. Determines the key and serializes item to JSON.
+    /// If an error occurs during serialization it is not returned until execute()
+    /// so that this method can be chained and called multiple times without error
+    /// checking each time.
+    fn store<T: Serialize + RedisKey>(&mut self, data: &T)
+                                      -> &'a mut RedisStoreMany
+    {
+        let key = data.key();
+
+        let json = match serde_json::to_string(data) {
+            Err(e) => {
+                self.serialization_errors.insert(key, e.to_string());
+                return self;
+            },
+            Ok(v) => v,
+        };
+
+        self.data.insert(key, json);
+        
+        self
+    }
+
+    /// Serialize items and store in Redis.
+    async fn execute(&mut self, redis_conn: &mut MultiplexedConnection)
+               -> Result<(), String>
+    {
+        if self.serialization_errors.len() > 0 {
+            let mut error_str = String::from("Serialization errors occurred: ");
+
+            let mut i = 0;
+            for (key, e) in &self.serialization_errors {
+                if i > 0 {
+                    error_str.push_str(", ");
+                }
+                
+                error_str.push_str(&format!("Failed to serialize item at key {}\
+                                             as JSON: {}", key, e));
+                i += 1;
+            }
+
+            return Err(error_str);
+        }
+
+        for (key, data_json) in &self.data {
+            self.redis_pipeline.cmd("SET").arg(key).arg(data_json);
+        }
+
+        match self.redis_pipeline.query_async::<MultiplexedConnection, Vec<String>>(
+            redis_conn).await
+        {
+            Err(e) => return Err(format!("Failed to execute set pipeline: {}", e)),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Retreive an item represented in Redis as JSON
@@ -66,9 +145,10 @@ async fn load_from_redis<T: DeserializeOwned + RedisKey>(
 }
 
 /// A video sync session which holds video state.
+/// Times are the number of non-leap seconds since EPOCH in UTC.
 #[derive(Serialize,Deserialize)]
 struct SyncSession {
-    /// Unique identifier.
+    /// Identifier, UUIDv4.
     id: String,
 
     /// Name of session.
@@ -77,11 +157,16 @@ struct SyncSession {
     /// If video is running.
     playing: bool,
 
-    /// Number of seconds into video.
+    /// Number of seconds into video when it was the time specified
+    /// by last_updated.
     timestamp_seconds: i32,
 
-    /// Last time the session was updated. Used to find old sessions and
-    /// delete them. Value is the number of non-leap seconds since EPOCH in UTC.
+    /// Client's time when they updated timestamp_seconds.
+    timestamp_last_updated: i64,
+
+    /// Last time any information about session was updated, including
+    /// timestamp_seconds This time is the server's time. Since it is only used
+    /// to find old sessions. User updates are not included.
     last_updated: i64,
 }
 
@@ -92,15 +177,56 @@ impl RedisKey for SyncSession {
 }
 
 impl SyncSession {
-    /// Creates a new sync session with only the id field populated. All other
-    /// fields have default values. These should be replaced before use.
-    fn new_only_id(id: String) -> SyncSession {
+    /// Creates a new sync session with only the id field populated. This allows
+    /// the structure to function properly as a RedisKey. All nother fields have
+    /// empty values which should be replaced before use. 
+    fn new_for_key(id: String) -> SyncSession {
         SyncSession{
             id: id,
             name: String::from(""),
             playing: false,
             timestamp_seconds: 0,
+            timestamp_last_updated: 0,
             last_updated: 0,
+        }
+    }
+}
+
+/// User in a sync session.
+/// Times are the number of non-leap seconds since EPOCH in UTC.
+#[derive(Serialize)]
+struct User {
+    /// Identifier UUIDv4. This value is treated as a secret which only the
+    /// user themselves know.
+    #[serde(skip)]
+    id: String,
+
+    /// Identifier of sync session user belongs to.
+    sync_session_id: String,
+    
+    /// Friendly name to identify user.
+    name: String,
+
+    /// Last time the client was seen from the server's perspective.
+    last_seen: i64,
+}
+
+impl RedisKey for User {
+    fn key(&self) -> String {
+        format!("sync_session:{}:user:{}", self.sync_session_id, self.id)
+    }
+}
+
+impl User {
+    /// Creates a user with the id and sync_session_id fields populated. This
+    /// allows the structure to function properly as a RedisKey. All other fields
+    /// are given empty values and should be replaced before use.
+    fn new_for_key(sync_session_id: String, id: String) -> User {
+        User{
+            id: id,
+            sync_session_id: sync_session_id,
+            name: String::from(""),
+            last_seen: 0,
         }
     }
 }
@@ -142,11 +268,17 @@ struct CreateSyncSessionReq {
     name: String,
 }
 
-/// Response of create and get sync session endpoint.
+/// Response of create sync session endpoint.
 #[derive(Serialize)]
-struct ASyncSessionResp {
-    /// Creted sync session.
+struct CreateSyncSessionResp {
+    /// Created sync session.
     sync_session: SyncSession,
+
+    /// User to be used by client who just created the sync session.
+    user: User,
+
+    /// Secret ID of user to be used by client who just crated the sync session.
+    user_id: String,
 }
 
 /// Creates a new sync session.
@@ -155,23 +287,49 @@ async fn create_sync_session(
     req: web::Json<CreateSyncSessionReq>
 ) -> impl Responder
 {
+    let now = Utc::now().timestamp();
+    
     let sess = SyncSession{
         id: Uuid::new_v4().to_string(),
         name: req.name.clone(),
         playing: false,
         timestamp_seconds: 0,
-        last_updated: Utc::now().timestamp(),
+        timestamp_last_updated: now,
+        last_updated: now,
     };
 
-    match store_in_redis(&mut data.redis_conn.lock().unwrap(), &sess).await {
+    let user = User{
+        id: Uuid::new_v4().to_string(),
+        sync_session_id: String::from(&sess.id),
+        name: String::from("Admin"),
+        last_seen: now,
+    };
+
+    let mut redis_pipeline = redis::pipe();
+    redis_pipeline.atomic();
+
+    match RedisStoreMany::new(&mut redis_pipeline)
+        .store(&sess)
+        .store(&user)
+        .execute(&mut data.redis_conn.lock().unwrap()).await
+    {
         Err(e) => return HttpResponse::InternalServerError().json(
             ErrorResp::new("Failed to save new sync session", &e)),
         _ => (),
     };
     
-    HttpResponse::Ok().json(ASyncSessionResp{
+    HttpResponse::Ok().json(CreateSyncSessionResp{
         sync_session: sess,
+        user_id: String::from(&user.id),
+        user: user,
     })
+}
+
+/// Get sync session endpoint response.
+#[derive(Serialize)]
+struct GetSyncSessionResp {
+    /// Retrieved sync session.
+    sync_session: SyncSession,
 }
 
 /// Retrieves a sync session by ID.
@@ -180,7 +338,7 @@ async fn get_sync_session(
     urldata: web::Path<String>
 ) -> impl Responder
 {
-    let sess_key = SyncSession::new_only_id(urldata.into_inner());
+    let sess_key = SyncSession::new_for_key(urldata.into_inner());
     
     let sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
                                      &sess_key).await
@@ -192,11 +350,70 @@ async fn get_sync_session(
 
     match sess {
         None => HttpResponse::NotFound().json(
-            ErrorResp::new("Not found", "No item with key in redis")),
-        Some(v) => HttpResponse::Ok().json(ASyncSessionResp{
+            ErrorResp::new(&format!("Sync session {} not found", sess_key.id),
+                           "Not specified")),
+        Some(v) => HttpResponse::Ok().json(GetSyncSessionResp{
             sync_session: v,
         }),
     }
+}
+
+/// Update sync session metadata request.
+#[derive(Deserialize)]
+struct UpdateSyncSessMetaReq {
+    /// New name for sync session, None if the name should not be updated.
+    name: Option<String>,
+}
+
+/// Update sync session metadata response.
+#[derive(Serialize)]
+struct UpdateSyncSessMetaResp {
+    /// Updated sync session.
+    sync_session: SyncSession,
+}
+
+/// Updates a sync session's metadata.
+async fn update_sync_session_metadata(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+    req: web::Json<UpdateSyncSessMetaReq>,
+) -> impl Responder
+{
+    let sess_key = SyncSession::new_for_key(urldata.into_inner());
+
+    let mut sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
+                                         &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ErrorResp::new("Error finding sync session to update",
+                           &format!("Failed to get sync session: {}", e))),
+        Ok(v) => match v {
+            None => return HttpResponse::NotFound().json(
+                ErrorResp::new(&format!("Sync session {} not found", sess_key.id),
+                               "Not specified")),
+            Some(v) => v,
+        },
+    };
+
+    if let Some(new_name) = &req.name {
+        sess.name = String::from(new_name);
+    } else {
+        return HttpResponse::BadRequest().json(
+            ErrorResp::new("Request must contain at least one field to update",
+                           "Not specified"));
+    }
+
+    sess.last_updated = Utc::now().timestamp();
+
+    match store_in_redis(&mut data.redis_conn.lock().unwrap(), &sess).await {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ErrorResp::new("Failed to update sync session", &e)),
+        _ => (),
+    }
+
+    HttpResponse::Ok().json(UpdateSyncSessMetaResp{
+        sync_session: sess,
+    })
 }
 
 /// Default handler when no registered routes match a request.
@@ -257,6 +474,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v0/status", web::get().to(server_status))
             .route("/api/v0/sync_session", web::post().to(create_sync_session))
             .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
+            .route("/api/v0/sync_session/{id}", web::put()
+                   .to(update_sync_session_metadata))
             .default_service(web::route().to(not_found))
             .wrap(Logger::default())
     })
