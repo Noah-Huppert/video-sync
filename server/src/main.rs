@@ -14,6 +14,9 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Number of seconds sync session and user keys last in Redis. Set to 1 day.
+const REDIS_KEY_TTL: usize = 86400;
+
 /// HTTP app state.
 struct AppState {
     redis_conn: Mutex<MultiplexedConnection>,
@@ -52,6 +55,10 @@ struct RedisStoreMany<'a> {
     /// Data to store. Keys = Redis key, values = JSON
     data: HashMap<String, String>,
 
+    /// Time to live values for any keys in data. Keys = Redis key,
+    /// values = time to live in seconds.
+    ttls: HashMap<String, usize>,
+
     /// Errors which occured during serialization in the store() method.
     /// Keys = Redis key, values = error strings.
     serialization_errors: HashMap<String, String>,
@@ -63,6 +70,7 @@ impl <'a> RedisStoreMany<'a> {
         RedisStoreMany{
             redis_pipeline: redis_pipeline,
             data: HashMap::new(),
+            ttls: HashMap::new(),
             serialization_errors: HashMap::new(),
         }
     }
@@ -89,6 +97,16 @@ impl <'a> RedisStoreMany<'a> {
         self
     }
 
+    /// Sets a key's expiration time to live in seconds. Included in this struct
+    /// because setting a key clears any existing TTL.
+    fn expire<T: RedisKey>(&mut self, key: &T, ttl: usize)
+                           -> &'a mut RedisStoreMany
+    {
+        self.ttls.insert(key.key(), ttl);
+
+        self
+    }
+
     /// Serialize items and store in Redis.
     async fn execute(&mut self, redis_conn: &mut MultiplexedConnection)
                -> Result<(), String>
@@ -112,6 +130,14 @@ impl <'a> RedisStoreMany<'a> {
 
         for (key, data_json) in &self.data {
             self.redis_pipeline.cmd("SET").arg(key).arg(data_json);
+
+            match self.ttls.get(key) {
+                Some(ttl) => {
+                    self.redis_pipeline.cmd("EXPIRE").arg(key).arg(*ttl);
+                    ()
+                },
+                None => (),
+            };
         }
 
         match self.redis_pipeline.query_async::<MultiplexedConnection, Vec<String>>(
@@ -309,8 +335,8 @@ async fn create_sync_session(
     redis_pipeline.atomic();
 
     match RedisStoreMany::new(&mut redis_pipeline)
-        .store(&sess)
-        .store(&user)
+        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&user).expire(&user, REDIS_KEY_TTL)
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -405,7 +431,13 @@ async fn update_sync_session_metadata(
 
     sess.last_updated = Utc::now().timestamp();
 
-    match store_in_redis(&mut data.redis_conn.lock().unwrap(), &sess).await {
+    let mut redis_pipeline = redis::pipe();
+    redis_pipeline.atomic();
+
+    match RedisStoreMany::new(&mut redis_pipeline)
+        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .execute(&mut data.redis_conn.lock().unwrap()).await
+    {
         Err(e) => return HttpResponse::InternalServerError().json(
             ErrorResp::new("Failed to update sync session", &e)),
         _ => (),
@@ -423,45 +455,44 @@ async fn not_found(req: HttpRequest) -> impl Responder
         ErrorResp::new("Not found", &format!("{} does not exist", req.path())))
 }
 
-#[actix_rt::main]
-async fn main() -> std::io::Result<()> {
-    // Setup logger
-    env_logger::from_env(Env::default().default_filter_or("debug")).init();
-    
-    // Connect to Redis
-    info!("Connecting to Redis");
+/// Creates a Redis connection and sends a ping command to test the connection.
+async fn new_redis_connection() -> Result<MultiplexedConnection, String> {
     let redis_client = match redis::Client::open("redis://127.0.0.1/") {
-        Err(e) => return Err(
-            std::io::Error::new(std::io::ErrorKind::Other,
-                                format!("Failed to open redis connection: {}",
-                                        e))),
+        Err(e) => return Err(format!("Failed to open redis connection: {}", e)),
         Ok(v) => v,
     };
+    
     let (mut redis_conn, redis_driver) = match
         redis_client.get_multiplexed_async_connection().await
     {
-        Err(e) => return Err(
-            std::io::Error::new(std::io::ErrorKind::Other,
-                                format!("Failed to get redis connection: {}",
-                                        e))),
+        Err(e) => return Err(format!("Failed to get redis connection: {}", e)),
         Ok(v) => v,
         
     };
 
     actix_rt::spawn(redis_driver);
 
-    info!("Testing Redis connection");
-    
     let ping_res: RedisResult<String> = redis::cmd("PING")
         .query_async(&mut redis_conn).await;
     if ping_res != Ok("PONG".to_string()) {
-        return Err(
-            std::io::Error::new(std::io::ErrorKind::Other,
-                                format!("Redis ping connection test failed: {:?}",
-                                        ping_res)));
+        return Err(format!("Redis ping connection test failed: {:?}", ping_res));
     }
 
-    info!("Successfully connected to Redis");
+    Ok(redis_conn)
+}
+
+#[actix_rt::main]
+async fn main() -> std::io::Result<()> {
+    // Setup logger
+    env_logger::from_env(Env::default().default_filter_or("debug")).init();
+    
+    // Connect to Redis
+    let mut redis_conn = match new_redis_connection().await {
+        Err(e) => return Err(std::io::Error::new(
+            std::io::ErrorKind::Other, format!("Failed to connect to Redis: {}",
+                                               e))),
+        Ok(v) => v,
+    };
 
     // Start HTTP server
     let app_state = web::Data::new(AppState{
@@ -482,6 +513,4 @@ async fn main() -> std::io::Result<()> {
         .bind("0.0.0.0:8000")?
         .run()
         .await
-
-   
 }
