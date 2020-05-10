@@ -26,9 +26,9 @@ trait RedisKey {
 }
 
 /// Store item as JSON in Redis
-async fn store_in_redis(
+async fn store_in_redis<T: Serialize + RedisKey>(
     redis_conn: &mut MultiplexedConnection,
-    data: impl Serialize + RedisKey
+    data: &T
 ) -> Result<(), String>
 {
     let data_json = match serde_json::to_string(&data) {
@@ -47,20 +47,22 @@ async fn store_in_redis(
 /// Retreive an item represented in Redis as JSON
 async fn load_from_redis<T: DeserializeOwned + RedisKey>(
     redis_conn: &mut MultiplexedConnection,
-    dest: &mut T
-) -> Result<(), String>
+    key: &T
+) -> Result<Option<T>, String>
 {
-    let data_json: String = match redis_conn.get(dest.key()).await {
+    let data_json = match redis_conn.get::<String, Option<String>>(key.key()).await
+    {
         Err(e) => return Err(format!("Failed to get data from Redis: {}", e)),
-        Ok(v) => v,
+        Ok(v) => match v {
+            None => return Ok(None),
+            Some(v) => v,
+        },
     };
 
-    *dest = match serde_json::from_str(data_json.as_str()) {
-        Err(e) => return Err(format!("Failed to deserialize data: {}", e)),
-        Ok(v) => v,
-    };
-
-    Ok(())
+    match serde_json::from_str::<T>(data_json.as_str()) {
+        Err(e) => Err(format!("Failed to deserialize data: {}", e)),
+        Ok(v) => Ok(Some(v)),
+    }
 }
 
 /// A video sync session which holds video state.
@@ -83,9 +85,23 @@ struct SyncSession {
     last_updated: i64,
 }
 
-impl RedisKey for &SyncSession {
+impl RedisKey for SyncSession {
     fn key(&self) -> String {
         format!("sync_session:{}", self.id)
+    }
+}
+
+impl SyncSession {
+    /// Creates a new sync session with only the id field populated. All other
+    /// fields have default values. These should be replaced before use.
+    fn new_only_id(id: String) -> SyncSession {
+        SyncSession{
+            id: id,
+            name: String::from(""),
+            playing: false,
+            timestamp_seconds: 0,
+            last_updated: 0,
+        }
     }
 }
 
@@ -126,9 +142,9 @@ struct CreateSyncSessionReq {
     name: String,
 }
 
-/// Response of create sync session endpoint.
+/// Response of create and get sync session endpoint.
 #[derive(Serialize)]
-struct CreateSyncSessionResp {
+struct ASyncSessionResp {
     /// Creted sync session.
     sync_session: SyncSession,
 }
@@ -153,13 +169,39 @@ async fn create_sync_session(
         _ => (),
     };
     
-    HttpResponse::Ok().json(CreateSyncSessionResp{
+    HttpResponse::Ok().json(ASyncSessionResp{
         sync_session: sess,
     })
 }
 
+/// Retrieves a sync session by ID.
+async fn get_sync_session(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>
+) -> impl Responder
+{
+    let sess_key = SyncSession::new_only_id(urldata.into_inner());
+    
+    let sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
+                                     &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ErrorResp::new("Failed to get sync session", &e)),
+        Ok(v) => v,
+    };
+
+    match sess {
+        None => HttpResponse::NotFound().json(
+            ErrorResp::new("Not found", "No item with key in redis")),
+        Some(v) => HttpResponse::Ok().json(ASyncSessionResp{
+            sync_session: v,
+        }),
+    }
+}
+
 /// Default handler when no registered routes match a request.
-async fn not_found(req: HttpRequest) -> impl Responder {
+async fn not_found(req: HttpRequest) -> impl Responder
+{
     HttpResponse::NotFound().json(
         ErrorResp::new("Not found", &format!("{} does not exist", req.path())))
 }
@@ -167,7 +209,7 @@ async fn not_found(req: HttpRequest) -> impl Responder {
 #[actix_rt::main]
 async fn main() -> std::io::Result<()> {
     // Setup logger
-    env_logger::from_env(Env::default().default_filter_or("info")).init();
+    env_logger::from_env(Env::default().default_filter_or("debug")).init();
     
     // Connect to Redis
     info!("Connecting to Redis");
@@ -214,6 +256,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state.clone())
             .route("/api/v0/status", web::get().to(server_status))
             .route("/api/v0/sync_session", web::post().to(create_sync_session))
+            .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
             .default_service(web::route().to(not_found))
             .wrap(Logger::default())
     })

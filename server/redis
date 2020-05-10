@@ -50,7 +50,8 @@ case "$1" in
 		  *) die "Cannot get logs if Redis is not running" ;;
 	   esac
 	   ;;
+    cli) $container_cli run -it --rm --net host "$container_tag" redis-cli ;;
     *)
-	   die "first argument must be \"start\", \"status\", \"stop\", \"logs\""
+	   die "first argument must be \"start\", \"status\", \"stop\", \"logs\", \"cli\""
 	   ;;
 esac
