@@ -1,11 +1,18 @@
-#[macro_use] extern crate serde;
 use serde_json;
 use serde::{Serialize,Deserialize};
 use serde::de::DeserializeOwned;
-use actix_web::{HttpServer,App,web,Responder,HttpRequest,HttpResponse};
+
+use actix_web::{web,http,HttpServer,App,Responder,HttpRequest,HttpResponse};
+use actix_web::dev::{ServiceResponse,ResponseBody};
 use actix_web::middleware::Logger;
+use actix_web::middleware::errhandlers::{ErrorHandlerResponse,ErrorHandlers};
+use actix_service::Service;
+
 use redis::{RedisResult,AsyncCommands};
 use redis::aio::MultiplexedConnection;
+
+use futures::prelude::*;
+
 #[macro_use] extern crate log;
 use env_logger::Env;
 use uuid::Uuid;
@@ -185,7 +192,7 @@ struct SyncSession {
 
     /// Number of seconds into video when it was the time specified
     /// by last_updated.
-    timestamp_seconds: i32,
+    timestamp_seconds: i64,
 
     /// Client's time when they updated timestamp_seconds.
     timestamp_last_updated: i64,
@@ -257,18 +264,33 @@ impl User {
     }
 }
 
-/// Response which all non-200 responses will use.
+/// Response which all 5xx responses use.
 #[derive(Serialize)]
-struct ErrorResp<'a> {
+struct ServerErrorResp<'a> {
+    /// Public error message.
+    error: &'a str,
+}
+
+impl <'a> ServerErrorResp<'a> {
+    fn new(public_error: &'a str, internal_error: &'a str) -> ServerErrorResp<'a> {
+        error!("public error={}, internal error={}", public_error, internal_error);
+        ServerErrorResp{
+            error: public_error,
+        }
+    }
+}
+
+/// Response which all 4xx responses use.
+#[derive(Serialize)]
+struct UserErrorResp<'a> {
     /// User error message.
     error: &'a str,
 }
 
-impl <'a> ErrorResp<'a> {
-    fn new(user_error: &'a str, internal_error: &'a str) -> ErrorResp<'a> {
-        error!("user error={}, internal error={}", user_error, internal_error);
-        ErrorResp{
-            error: user_error,
+impl <'a> UserErrorResp<'a> {
+    fn new(error: &'a str) -> UserErrorResp<'a> {
+        UserErrorResp{
+            error: error,
         }
     }
 }
@@ -340,7 +362,7 @@ async fn create_sync_session(
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
-            ErrorResp::new("Failed to save new sync session", &e)),
+            ServerErrorResp::new("Failed to save new sync session", &e)),
         _ => (),
     };
     
@@ -370,14 +392,14 @@ async fn get_sync_session(
                                      &sess_key).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
-            ErrorResp::new("Failed to get sync session", &e)),
+            ServerErrorResp::new("Failed to get sync session", &e)),
         Ok(v) => v,
     };
 
     match sess {
         None => HttpResponse::NotFound().json(
-            ErrorResp::new(&format!("Sync session {} not found", sess_key.id),
-                           "Not specified")),
+            UserErrorResp::new(&format!("Sync session {} not found",
+                                        sess_key.id))),
         Some(v) => HttpResponse::Ok().json(GetSyncSessionResp{
             sync_session: v,
         }),
@@ -411,12 +433,12 @@ async fn update_sync_session_metadata(
                                          &sess_key).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
-            ErrorResp::new("Error finding sync session to update",
+            ServerErrorResp::new("Error finding sync session to update",
                            &format!("Failed to get sync session: {}", e))),
         Ok(v) => match v {
             None => return HttpResponse::NotFound().json(
-                ErrorResp::new(&format!("Sync session {} not found", sess_key.id),
-                               "Not specified")),
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            sess_key.id))),
             Some(v) => v,
         },
     };
@@ -425,8 +447,8 @@ async fn update_sync_session_metadata(
         sess.name = String::from(new_name);
     } else {
         return HttpResponse::BadRequest().json(
-            ErrorResp::new("Request must contain at least one field to update",
-                           "Not specified"));
+            UserErrorResp::new("Request must contain at least one field \
+                                to update"));
     }
 
     sess.last_updated = Utc::now().timestamp();
@@ -439,7 +461,7 @@ async fn update_sync_session_metadata(
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
-            ErrorResp::new("Failed to update sync session", &e)),
+            ServerErrorResp::new("Failed to update sync session", &e)),
         _ => (),
     }
 
@@ -448,11 +470,105 @@ async fn update_sync_session_metadata(
     })
 }
 
+/// Update sync session status request. See SyncSession field documentation for
+/// more information on request fields.
+#[derive(Deserialize)]
+struct UpdateSyncSessionStatusReq {
+    playing: bool,
+    timestamp_seconds: i64,
+    timestamp_last_updated: i64,
+}
+
+/// Update sync session status response.
+#[derive(Serialize)]
+struct UpdateSyncSessionStatusResp {
+    sync_session: SyncSession,
+}
+
+async fn update_sync_session_status(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+    req: web::Json<UpdateSyncSessionStatusReq>,
+) -> impl Responder
+{
+    // Get session to update
+    let mut sess = SyncSession::new_for_key(urldata.to_string());
+
+    sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
+                                 &sess).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to retrieve sync session to update", &e)),
+        Ok(v) => match v {
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            &sess.id))),
+            Some(s) => s,
+        },
+    };
+
+    // Update and store
+    if &req.timestamp_last_updated <= &sess.timestamp_last_updated {
+        return HttpResponse::Conflict().json(
+            UserErrorResp::new(&format!("Sync session status has been updated \
+                                         more recently than the submitted \
+                                         request at {}",
+                                        &req.timestamp_last_updated)));
+    }
+    
+    sess.playing = req.playing;
+    sess.timestamp_seconds = req.timestamp_seconds;
+    sess.timestamp_last_updated = req.timestamp_last_updated;
+
+    match store_in_redis(&mut data.redis_conn.lock().unwrap(), &sess).await {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to save updated sync session", &e)),
+        _ => (),
+    };
+
+    HttpResponse::Ok().json(UpdateSyncSessionStatusResp{
+        sync_session: sess,
+    })
+}
+
 /// Default handler when no registered routes match a request.
 async fn not_found(req: HttpRequest) -> impl Responder
 {
-    HttpResponse::NotFound().json(
-        ErrorResp::new("Not found", &format!("{} does not exist", req.path())))
+    HttpResponse::NotFound().json(UserErrorResp::new("Not found"))
+}
+
+fn on_bad_request<B>(
+    mut res: ServiceResponse<B>
+) -> actix_web::Result<ErrorHandlerResponse<B>>
+{
+    let error_str: String = match res.response().error() {
+        Some(e) => format!("{}", e),
+        None => String::from("Bad request"),
+    };
+    
+    let resp_str = match serde_json::to_string(&UserErrorResp::new(&error_str)) {
+        Err(e) => {
+            error!("Failed to serialize bad request error response, tried to \
+                    serialize={}, serialize error={}", error_str, &e);
+            
+                String::from("{\"error\": \"There was an error with your \
+                              request, but while handling this an internal server \
+                              error occurred\"}")
+        },
+        Ok(v) => v,
+    };
+
+    res.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json")
+    );
+
+    let new_res = res.map_body(|_head, _body| {
+        ResponseBody::<B>::Other(actix_web::dev::Body::Bytes(
+            actix_web::web::Bytes::from(resp_str)))
+    });
+
+    Ok(ErrorHandlerResponse::Response(new_res))
 }
 
 /// Creates a Redis connection and sends a ping command to test the connection.
@@ -487,7 +603,7 @@ async fn main() -> std::io::Result<()> {
     env_logger::from_env(Env::default().default_filter_or("debug")).init();
     
     // Connect to Redis
-    let mut redis_conn = match new_redis_connection().await {
+    let redis_conn = match new_redis_connection().await {
         Err(e) => return Err(std::io::Error::new(
             std::io::ErrorKind::Other, format!("Failed to connect to Redis: {}",
                                                e))),
@@ -507,8 +623,12 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
             .route("/api/v0/sync_session/{id}", web::put()
                    .to(update_sync_session_metadata))
+            .route("/api/v0/sync_session/{id}/status", web::put()
+                   .to(update_sync_session_status))
             .default_service(web::route().to(not_found))
             .wrap(Logger::default())
+            .wrap(ErrorHandlers::new()
+                  .handler(http::StatusCode::BAD_REQUEST, on_bad_request))
     })
         .bind("0.0.0.0:8000")?
         .run()
