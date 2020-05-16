@@ -6,12 +6,9 @@ use actix_web::{web,http,HttpServer,App,Responder,HttpRequest,HttpResponse};
 use actix_web::dev::{ServiceResponse,ResponseBody};
 use actix_web::middleware::Logger;
 use actix_web::middleware::errhandlers::{ErrorHandlerResponse,ErrorHandlers};
-use actix_service::Service;
 
-use redis::{RedisResult,AsyncCommands};
+use redis::{RedisResult,AsyncCommands,FromRedisValue};
 use redis::aio::MultiplexedConnection;
-
-use futures::prelude::*;
 
 #[macro_use] extern crate log;
 use env_logger::Env;
@@ -26,13 +23,35 @@ const REDIS_KEY_TTL: usize = 86400;
 
 /// HTTP app state.
 struct AppState {
+    /// Asynchronous Redis connection. Preferable to use when possible.
     redis_conn: Mutex<MultiplexedConnection>,
 }
 
-/// Provides the key in Redis which an object will be stored.
+/// Provides the key in Redis under which an object will be stored.
 trait RedisKey {
-    /// Redis key.
+    /// Redis key for the specific item. The returned result can be used with the
+    /// Redis SCAN command if the object's key fields are set to "*".
     fn key(&self) -> String;
+}
+
+/// Implements the RedisKey trait by returning a static String value.
+struct StringRedisKey {
+    key: String,
+}
+
+impl StringRedisKey {
+    /// Creates a new StringRedisKey.
+    fn new(key: String) -> StringRedisKey {
+        StringRedisKey{
+            key: key,
+        }
+    }
+}
+
+impl RedisKey for StringRedisKey {
+    fn key(&self) -> String {
+        String::from(self.key.as_str())
+    }
 }
 
 /// Store item as JSON in Redis.
@@ -105,7 +124,8 @@ impl <'a> RedisStoreMany<'a> {
     }
 
     /// Sets a key's expiration time to live in seconds. Included in this struct
-    /// because setting a key clears any existing TTL.
+    /// because setting a key clears any existing TTL. The store() method must be
+    /// called with the same key for this method to have any effect.
     fn expire<T: RedisKey>(&mut self, key: &T, ttl: usize)
                            -> &'a mut RedisStoreMany
     {
@@ -157,9 +177,9 @@ impl <'a> RedisStoreMany<'a> {
 }
 
 /// Retreive an item represented in Redis as JSON
-async fn load_from_redis<T: DeserializeOwned + RedisKey>(
+async fn load_from_redis<T: DeserializeOwned, K: RedisKey>(
     redis_conn: &mut MultiplexedConnection,
-    key: &T
+    key: &K
 ) -> Result<Option<T>, String>
 {
     let data_json = match redis_conn.get::<String, Option<String>>(key.key()).await
@@ -175,6 +195,89 @@ async fn load_from_redis<T: DeserializeOwned + RedisKey>(
         Err(e) => Err(format!("Failed to deserialize data: {}", e)),
         Ok(v) => Ok(Some(v)),
     }
+}
+
+/// Implements Stream like behavior by calling the Redis SCAN command and using the
+/// returned cursor to fetch more items when required. Returns a Result<T, String>
+/// because an error could occur when fetching the newest bunch of values from
+/// Redis. The actual Stream trait was not implemented because I got caught up in
+/// Rust semantics.
+struct RedisScanStream<'a, T: FromRedisValue> {
+    /// Redis connection used to execute SCAN commands.
+    redis_conn: &'a mut MultiplexedConnection,
+
+    /// SCAN command MATCH <pattern> argument. None if a match argument should
+    /// not be sent.
+    match_arg: Option<String>,
+
+    /// Items retrieved by last SCAN command invocation.
+    items: Vec<T>,
+
+    /// SCAN redis cursor. None if this is the first invocation of SCAN and no
+    /// cursor exists yet.
+    redis_cursor: Option<u64>,
+}
+
+impl <'a, T: FromRedisValue> RedisScanStream<'a, T> {
+    /// Creates a new RedisScanStream.
+    fn new(
+        redis_conn: &'a mut MultiplexedConnection,
+        match_arg: Option<String>
+    ) -> RedisScanStream<'a, T>
+    {
+        RedisScanStream{
+            redis_conn: redis_conn,
+            match_arg: match_arg,
+            items: Vec::new(),
+            redis_cursor: None,
+        }
+    }
+    
+    /// Pops items off the items vector until it is empty. Then invokes the SCAN
+    /// Redis command again to refill this vector until no more results
+    /// are returned.
+    async fn next(&mut self) -> Option<Result<T, String>> {
+        // Try to get more items from the vector.
+        match self.items.pop() {
+            Some(v) => return Some(Ok(v)),
+            _ => (),
+        };
+
+        // If no items and cursor is 0, stream is done.
+        if self.redis_cursor == Some(0) {
+            return None;
+        }
+
+        // Refill items with the results of the SCAN command.
+        let cursor_arg = match self.redis_cursor {
+            Some(v) => v,
+            None => 0,
+        };
+        
+        let mut cmd = redis::cmd("SCAN");
+        cmd.arg(cursor_arg);
+
+        if let Some(match_arg_val) = &self.match_arg {
+            cmd.arg("MATCH").arg(match_arg_val);
+        }
+
+        let (new_cursor, mut new_items): (u64, Vec<T>) = match cmd
+            .query_async(self.redis_conn).await
+        {
+            Err(e) => return Some(Err(
+                format!("Failed to scan for keys: {}", e))),
+            Ok(v) => v,
+        };
+
+        self.redis_cursor = Some(new_cursor);
+        self.items.append(&mut new_items);
+
+        // Finally used newly refilled items to return
+        match self.items.pop() {
+            Some(v) => Some(Ok(v)),
+            None => None,
+        }
+}
 }
 
 /// A video sync session which holds video state.
@@ -227,7 +330,7 @@ impl SyncSession {
 
 /// User in a sync session.
 /// Times are the number of non-leap seconds since EPOCH in UTC.
-#[derive(Serialize)]
+#[derive(Serialize,Deserialize)]
 struct User {
     /// Identifier UUIDv4. This value is treated as a secret which only the
     /// user themselves know.
@@ -246,7 +349,7 @@ struct User {
 
 impl RedisKey for User {
     fn key(&self) -> String {
-        format!("sync_session:{}:user:{}", self.sync_session_id, self.id)
+        format!("sync_session:user:{}:{}", self.sync_session_id, self.id)
     }
 }
 
@@ -378,6 +481,9 @@ async fn create_sync_session(
 struct GetSyncSessionResp {
     /// Retrieved sync session.
     sync_session: SyncSession,
+
+    /// Users who are part of the sync session.
+    users: Vec<User>,
 }
 
 /// Retrieves a sync session by ID.
@@ -386,22 +492,68 @@ async fn get_sync_session(
     urldata: web::Path<String>
 ) -> impl Responder
 {
+    let redis_conn = &mut data.redis_conn.lock().unwrap();
+    
+    // Load sync session
     let sess_key = SyncSession::new_for_key(urldata.into_inner());
     
-    let sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
-                                     &sess_key).await
-    {
+    let sess = match load_from_redis(redis_conn, &sess_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to get sync session", &e)),
         Ok(v) => v,
     };
 
+    // Retrieve keys of users in sync session
+    let sess_users_key = User::new_for_key(String::from(&sess_key.id),
+                                           String::from("*"));
+    let mut sess_users_keys: Vec<String> = Vec::new();
+
+    let mut redis_scan = RedisScanStream::<String>::new(
+        redis_conn, Some(sess_users_key.key()));
+
+    while let Some(user_key_res) = redis_scan.next().await {
+        let user_key_str = match user_key_res {
+            Err(e) => return HttpResponse::InternalServerError().json(
+                ServerErrorResp::new("Failed to find users in sync session", &e)),
+            Ok(v) => v,
+        };
+
+        sess_users_keys.push(user_key_str);
+    }
+
+    // Retrieve users in sync session
+    let mut sess_users: Vec<User> = Vec::new();
+
+    for user_key_str in &sess_users_keys {
+        let user_key = StringRedisKey::new(String::from(user_key_str.as_str()));
+        
+        let user = match load_from_redis(redis_conn, &user_key).await {
+            Err(e) => return HttpResponse::InternalServerError().json(
+                ServerErrorResp::new("Failed to retrieve information about one of\
+                                      the users in the sync session",
+                                     &format!("Failed to get {}: {}",
+                                              &user_key_str, &e))),
+            Ok(v) => match v {
+                Some(some_v) => some_v,
+                None => return HttpResponse::InternalServerError().json(
+                    ServerErrorResp::new(
+                        "Failed to retrieve information about one of the users \
+                         in the sync session",
+                        &format!("The user {} does not exist in Redis but the key \
+                                  was found via SCAN", user_key_str))),
+            },
+        };
+        sess_users.push(user);
+    }
+
+    // Send result
     match sess {
         None => HttpResponse::NotFound().json(
             UserErrorResp::new(&format!("Sync session {} not found",
-                                        sess_key.id))),
+                                        &sess_key.id))),
         Some(v) => HttpResponse::Ok().json(GetSyncSessionResp{
             sync_session: v,
+            users: sess_users,
         }),
     }
 }
@@ -429,8 +581,8 @@ async fn update_sync_session_metadata(
 {
     let sess_key = SyncSession::new_for_key(urldata.into_inner());
 
-    let mut sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
-                                         &sess_key).await
+    let mut sess: SyncSession = match
+        load_from_redis(&mut data.redis_conn.lock().unwrap(), &sess_key).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Error finding sync session to update",
@@ -474,8 +626,13 @@ async fn update_sync_session_metadata(
 /// more information on request fields.
 #[derive(Deserialize)]
 struct UpdateSyncSessionStatusReq {
+    /// New sync session playing field.
     playing: bool,
+
+    /// New sync session timestamp_seconds field.
     timestamp_seconds: i64,
+
+    /// New sync session timestamp_last_updated field. 
     timestamp_last_updated: i64,
 }
 
@@ -485,6 +642,8 @@ struct UpdateSyncSessionStatusResp {
     sync_session: SyncSession,
 }
 
+/// Updates a sync session's playback status. Triggers sending an update message
+/// on the play status web socket.
 async fn update_sync_session_status(
     data: web::Data<AppState>,
     urldata: web::Path<String>,
@@ -526,13 +685,15 @@ async fn update_sync_session_status(
         _ => (),
     };
 
+    // TODO: Trigger update
+
     HttpResponse::Ok().json(UpdateSyncSessionStatusResp{
         sync_session: sess,
     })
 }
 
 /// Default handler when no registered routes match a request.
-async fn not_found(req: HttpRequest) -> impl Responder
+async fn not_found(_req: HttpRequest) -> impl Responder
 {
     HttpResponse::NotFound().json(UserErrorResp::new("Not found"))
 }
@@ -571,8 +732,10 @@ fn on_bad_request<B>(
     Ok(ErrorHandlerResponse::Response(new_res))
 }
 
-/// Creates a Redis connection and sends a ping command to test the connection.
-async fn new_redis_connection() -> Result<MultiplexedConnection, String> {
+/// Creates a plain and async Redis connection and sends a ping commands to test
+/// these connections.
+async fn new_redis_connection() -> Result<MultiplexedConnection, String>
+{
     let redis_client = match redis::Client::open("redis://127.0.0.1/") {
         Err(e) => return Err(format!("Failed to open redis connection: {}", e)),
         Ok(v) => v,
@@ -621,7 +784,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v0/status", web::get().to(server_status))
             .route("/api/v0/sync_session", web::post().to(create_sync_session))
             .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
-            .route("/api/v0/sync_session/{id}", web::put()
+            .route("/api/v0/sync_session/{id}/metadata", web::put()
                    .to(update_sync_session_metadata))
             .route("/api/v0/sync_session/{id}/status", web::put()
                    .to(update_sync_session_status))
