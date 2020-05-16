@@ -124,8 +124,7 @@ impl <'a> RedisStoreMany<'a> {
     }
 
     /// Sets a key's expiration time to live in seconds. Included in this struct
-    /// because setting a key clears any existing TTL. The store() method must be
-    /// called with the same key for this method to have any effect.
+    /// because setting a key clears any existing TTL.
     fn expire<T: RedisKey>(&mut self, key: &T, ttl: usize)
                            -> &'a mut RedisStoreMany
     {
@@ -157,14 +156,10 @@ impl <'a> RedisStoreMany<'a> {
 
         for (key, data_json) in &self.data {
             self.redis_pipeline.cmd("SET").arg(key).arg(data_json);
+        }
 
-            match self.ttls.get(key) {
-                Some(ttl) => {
-                    self.redis_pipeline.cmd("EXPIRE").arg(key).arg(*ttl);
-                    ()
-                },
-                None => (),
-            };
+        for (key, ttl) in &self.ttls {
+            self.redis_pipeline.cmd("EXPIRE").arg(key).arg(*ttl);
         }
 
         match self.redis_pipeline.query_async::<MultiplexedConnection, Vec<String>>(
@@ -678,17 +673,104 @@ async fn update_sync_session_status(
     sess.playing = req.playing;
     sess.timestamp_seconds = req.timestamp_seconds;
     sess.timestamp_last_updated = req.timestamp_last_updated;
+    sess.last_updated = Utc::now().timestamp();
 
-    match store_in_redis(&mut data.redis_conn.lock().unwrap(), &sess).await {
+    let mut pipeline = redis::pipe();
+    pipeline.atomic();
+
+    match RedisStoreMany::new(&mut pipeline)
+        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .execute(&mut data.redis_conn.lock().unwrap()).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to save updated sync session", &e)),
         _ => (),
     };
 
-    // TODO: Trigger update
+    // TODO: Trigger update message on web socket
 
     HttpResponse::Ok().json(UpdateSyncSessionStatusResp{
         sync_session: sess,
+    })
+}
+
+/// Request for the update sync session user endpoint.
+#[derive(Deserialize)]
+struct UpdateSyncSessionUserReq {
+    /// New name of the user.
+    name: String,
+}
+
+/// Response for the update sync session user endpoint.
+#[derive(Serialize)]
+struct UpdateSyncSessionUserResp {
+    /// Updated user.
+    user: User,
+}
+
+/// Updates a user in the specified sync session.
+async fn update_sync_session_user(
+    data: web::Data<AppState>,
+    urldata: web::Path<(String, String)>,
+    req: web::Json<UpdateSyncSessionUserReq>,
+) -> impl Responder
+{
+    // Get user
+    let user_key = User::new_for_key(String::from(urldata.0.as_str()),
+                                     String::from(urldata.1.as_str()));
+    let mut user: User = match load_from_redis(
+        &mut data.redis_conn.lock().unwrap(), &user_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to get user to update", &e)),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("User in sync session {} with id {} \
+                                             was not found",
+                                            &urldata.0, &urldata.1))),
+        },
+    };
+
+    // Get sync session
+    let sess_key = SyncSession::new_for_key(String::from(urldata.0.as_str()));
+    
+    let mut sess: SyncSession = match load_from_redis(
+        &mut data.redis_conn.lock().unwrap(), &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new(
+                "Failed to get sync session associated with user", &e)),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} which is associated \
+                                             with the user {} was not found",
+                                            &urldata.0, &urldata.1))),
+        },
+    };
+
+    // Update user
+    user.id = String::from(urldata.1.as_str());
+    user.name = String::from(req.name.as_str());
+    user.last_seen = Utc::now().timestamp();
+
+    sess.last_updated = Utc::now().timestamp();
+    
+    let mut redis_pipeline = redis::pipe();
+    redis_pipeline.atomic();
+
+    match RedisStoreMany::new(&mut redis_pipeline)
+        .store(&user).expire(&user, REDIS_KEY_TTL)
+        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .execute(&mut data.redis_conn.lock().unwrap()).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to save updated user", &e)),
+        _ => (),
+    };
+
+    HttpResponse::Ok().json(UpdateSyncSessionUserResp{
+        user: user,
     })
 }
 
@@ -788,6 +870,8 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_metadata))
             .route("/api/v0/sync_session/{id}/status", web::put()
                    .to(update_sync_session_status))
+            .route("/api/v0/sync_session/{session_id}/user/{user_id}", web::put()
+                   .to(update_sync_session_user))
             .default_service(web::route().to(not_found))
             .wrap(Logger::default())
             .wrap(ErrorHandlers::new()
