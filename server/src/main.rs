@@ -752,10 +752,87 @@ async fn join_sync_session(
         _ => (),
     };
 
+    // TODO: Trigger update on web socket
+
     HttpResponse::Ok().json(JoinSyncSessionResp{
         sync_session: sess,
         user_id: String::from(user.id.as_str()),
         user: user,
+    })
+}
+
+/// Request for the leave sync session endpoint.
+#[derive(Deserialize)]
+struct LeaveSyncSessionReq {
+    /// ID of user to remove from sync session.
+    user_id: String,
+}
+
+/// Response for the leave sync session endpoint.
+#[derive(Serialize)]
+struct LeaveSyncSessionResp {
+    /// Indicates operation succeeded.
+    ok: bool,
+}
+
+/// Removes a user from a sync session.
+async fn leave_sync_session(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+    req: web::Json<LeaveSyncSessionReq>
+) -> impl Responder
+{
+    let redis_conn = &mut data.redis_conn.lock().unwrap();
+    let url_sess_id = urldata.into_inner();
+    
+    // Check user exists
+    let user_key = User::new_for_key(String::from(&url_sess_id),
+                                     String::from(&req.user_id));
+    match redis_conn.exists::<String, bool>(user_key.key()).await {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to check if user exists",
+                                 &format!("{}", &e))),
+        Ok(exists) if !exists => return HttpResponse::NotFound().json(
+            UserErrorResp::new(&format!("User {} not found", &req.user_id))),
+        _ => (),
+    };
+
+    // Get sync session
+    let sess_key = SyncSession::new_for_key(String::from(url_sess_id.as_str()));
+
+    let mut sess: SyncSession = match load_from_redis(redis_conn, &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to get sync session", &e)),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            &sess_key.id))),
+        },
+    };
+
+    // Delete user
+    sess.last_updated = Utc::now().timestamp();
+
+    let mut pipeline = redis::pipe();
+    pipeline.atomic();
+
+    pipeline.cmd("DELETE").arg(&user_key.key());
+
+    match RedisStoreMany::new(&mut pipeline)
+        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .execute(redis_conn).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to delete user", &e)),
+        _ => (),
+    };
+
+    // TODO: Notify web socket
+
+    HttpResponse::Ok().json(LeaveSyncSessionResp{
+        ok: true,
     })
 }
 
@@ -839,6 +916,8 @@ async fn update_sync_session_user(
             ServerErrorResp::new("Failed to save updated user", &e)),
         _ => (),
     };
+
+    // TODO: Trigger update on web socket
 
     HttpResponse::Ok().json(UpdateSyncSessionUserResp{
         user: user,
@@ -943,6 +1022,8 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_status))
             .route("/api/v0/sync_session/{id}/join", web::post()
                    .to(join_sync_session))
+            .route("/api/v0/sync_session/{id}/user", web::delete()
+                   .to(leave_sync_session))
             .route("/api/v0/sync_session/{session_id}/user", web::put()
                    .to(update_sync_session_user))
             .default_service(web::route().to(not_found))
