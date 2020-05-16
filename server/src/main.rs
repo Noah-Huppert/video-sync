@@ -1020,7 +1020,7 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_metadata))
             .route("/api/v0/sync_session/{id}/status", web::put()
                    .to(update_sync_session_status))
-            .route("/api/v0/sync_session/{id}/join", web::post()
+            .route("/api/v0/sync_session/{id}/user", web::post()
                    .to(join_sync_session))
             .route("/api/v0/sync_session/{id}/user", web::delete()
                    .to(leave_sync_session))
