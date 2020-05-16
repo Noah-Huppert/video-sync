@@ -762,6 +762,9 @@ async fn join_sync_session(
 /// Request for the update sync session user endpoint.
 #[derive(Deserialize)]
 struct UpdateSyncSessionUserReq {
+    /// ID of user.
+    user_id: String,
+    
     /// New name of the user.
     name: String,
 }
@@ -776,13 +779,15 @@ struct UpdateSyncSessionUserResp {
 /// Updates a user in the specified sync session.
 async fn update_sync_session_user(
     data: web::Data<AppState>,
-    urldata: web::Path<(String, String)>,
+    urldata: web::Path<String>,
     req: web::Json<UpdateSyncSessionUserReq>,
 ) -> impl Responder
 {
+    let url_sess_id = urldata.into_inner();
+
     // Get user
-    let user_key = User::new_for_key(String::from(urldata.0.as_str()),
-                                     String::from(urldata.1.as_str()));
+    let user_key = User::new_for_key(String::from(url_sess_id.as_str()),
+                                     String::from(req.user_id.as_str()));
     let mut user: User = match load_from_redis(
         &mut data.redis_conn.lock().unwrap(), &user_key).await
     {
@@ -793,12 +798,12 @@ async fn update_sync_session_user(
             None => return HttpResponse::NotFound().json(
                 UserErrorResp::new(&format!("User in sync session {} with id {} \
                                              was not found",
-                                            &urldata.0, &urldata.1))),
+                                            &url_sess_id, &req.user_id))),
         },
     };
 
     // Get sync session
-    let sess_key = SyncSession::new_for_key(String::from(urldata.0.as_str()));
+    let sess_key = SyncSession::new_for_key(String::from(url_sess_id.as_str()));
     
     let mut sess: SyncSession = match load_from_redis(
         &mut data.redis_conn.lock().unwrap(), &sess_key).await
@@ -811,12 +816,12 @@ async fn update_sync_session_user(
             None => return HttpResponse::NotFound().json(
                 UserErrorResp::new(&format!("Sync session {} which is associated \
                                              with the user {} was not found",
-                                            &urldata.0, &urldata.1))),
+                                            &url_sess_id, &req.user_id))),
         },
     };
 
     // Update user
-    user.id = String::from(urldata.1.as_str());
+    user.id = String::from(req.user_id.as_str());
     user.name = String::from(req.name.as_str());
     user.last_seen = Utc::now().timestamp();
 
@@ -938,7 +943,7 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_status))
             .route("/api/v0/sync_session/{id}/join", web::post()
                    .to(join_sync_session))
-            .route("/api/v0/sync_session/{session_id}/user/{user_id}", web::put()
+            .route("/api/v0/sync_session/{session_id}/user", web::put()
                    .to(update_sync_session_user))
             .default_service(web::route().to(not_found))
             .wrap(Logger::default())
