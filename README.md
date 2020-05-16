@@ -14,4 +14,5 @@ See [`server/`](./server) for sync server code.
 # Design
 Users join sync sessions. The video state is synchronized inside this session.
 
-A HTTP API is used to set state. A web socket is used to push state updates.
+A HTTP API is used to set state. A web socket is used to push notifications of
+state updates.
