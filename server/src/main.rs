@@ -693,6 +693,72 @@ async fn update_sync_session_status(
     })
 }
 
+/// Response of join sync session endpoint.
+#[derive(Serialize)]
+struct JoinSyncSessionResp {
+    /// Sync session being joined.
+    sync_session: SyncSession,
+    
+    /// User created for client who is joining.
+    user: User,
+
+    /// ID of client's user.
+    user_id: String,
+}
+
+/// Creates a new user in the specified sync session.
+async fn join_sync_session(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+) -> impl Responder
+{
+    // Get sync session
+    let sess_key = SyncSession::new_for_key(urldata.into_inner());
+
+    let mut sess: SyncSession = match load_from_redis(
+        &mut data.redis_conn.lock().unwrap(), &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to get sync session", &e)),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            &sess_key.id))),
+        },
+    };
+
+    // Create user
+    let user = User{
+        id: Uuid::new_v4().to_string(),
+        sync_session_id: String::from(&sess.id),
+        name: String::from("Alice"),
+        last_seen: Utc::now().timestamp(),
+    };
+
+    // Store user and update sync session
+    sess.last_updated = Utc::now().timestamp();
+
+    let mut pipeline = redis::pipe();
+    pipeline.atomic();
+
+    match RedisStoreMany::new(&mut pipeline)
+        .store(&user).expire(&user, REDIS_KEY_TTL)
+        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .execute(&mut data.redis_conn.lock().unwrap()).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to save user", &e)),
+        _ => (),
+    };
+
+    HttpResponse::Ok().json(JoinSyncSessionResp{
+        sync_session: sess,
+        user_id: String::from(user.id.as_str()),
+        user: user,
+    })
+}
+
 /// Request for the update sync session user endpoint.
 #[derive(Deserialize)]
 struct UpdateSyncSessionUserReq {
@@ -870,6 +936,8 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_metadata))
             .route("/api/v0/sync_session/{id}/status", web::put()
                    .to(update_sync_session_status))
+            .route("/api/v0/sync_session/{id}/join", web::post()
+                   .to(join_sync_session))
             .route("/api/v0/sync_session/{session_id}/user/{user_id}", web::put()
                    .to(update_sync_session_user))
             .default_service(web::route().to(not_found))
