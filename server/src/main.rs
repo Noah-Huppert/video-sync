@@ -17,6 +17,7 @@ use chrono::Utc;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::marker::Sized;
 
 /// Number of seconds sync session and user keys last in Redis. Set to 1 day.
 const REDIS_KEY_TTL: usize = 86400;
@@ -28,10 +29,15 @@ struct AppState {
 }
 
 /// Provides the key in Redis under which an object will be stored.
-trait RedisKey {
+trait RedisKey where Self: Sized {
     /// Redis key for the specific item. The returned result can be used with the
     /// Redis SCAN command if the object's key fields are set to "*".
     fn key(&self) -> String;
+
+    /// Create an instance of the implementing type who's field values are
+    /// populated so calling key() would return the same redis key value which was
+    /// passed as an argument.
+    fn from_key(redis_key: String) -> Result<Self, String>;
 }
 
 /// Implements the RedisKey trait by returning a static String value.
@@ -51,6 +57,10 @@ impl StringRedisKey {
 impl RedisKey for StringRedisKey {
     fn key(&self) -> String {
         String::from(self.key.as_str())
+    }
+
+    fn from_key(redis_key: String) -> Result<Self, String> {
+        Ok(StringRedisKey::new(redis_key))
     }
 }
 
@@ -305,6 +315,17 @@ impl RedisKey for SyncSession {
     fn key(&self) -> String {
         format!("sync_session:{}", self.id)
     }
+
+    fn from_key(redis_key: String) -> Result<Self, String> {
+        let parts: Vec<&str> = redis_key.split(":").collect();
+
+        if parts.len() != 2 {
+            return Err(String::from("Provided redis key was invalid. Should be \
+                                     in format \"sync_session:<ID>\""));
+        }
+        
+        Ok(SyncSession::new_for_key(String::from(parts[1])))
+    }
 }
 
 impl SyncSession {
@@ -330,10 +351,14 @@ impl SyncSession {
 /// from the session. Admins cannot modify owners.
 #[derive(Serialize,Deserialize,Debug)]
 struct User {
-    /// Identifier UUIDv4. This value is treated as a secret which only the
-    /// user themselves know.
+    /// Secret identifier of user, UUIDv4. If a client has this ID they can make
+    /// changes to the user. Thus only the user themselves and admins know this ID.
     #[serde(skip)]
     id: String,
+
+    /// Public identifier of user. Everyone knows this ID but having it does not
+    /// grant any control over the user.
+    public_id: String,
 
     /// Identifier of sync session user belongs to.
     sync_session_id: String,
@@ -359,6 +384,20 @@ impl RedisKey for User {
     fn key(&self) -> String {
         format!("sync_session:user:{}:{}", self.sync_session_id, self.id)
     }
+
+    fn from_key(redis_key: String) -> Result<Self, String> {
+        let parts: Vec<&str> = redis_key.split(":").collect();
+
+        if parts.len() != 4 {
+            return Err(String::from("Provided redis key was invalid. Must be in \
+                                     the format \
+                                     \"sync_session:user:\
+                                     <sync session ID>:<user ID>\""));
+        }
+        
+        Ok(User::new_for_key(String::from(parts[2]),
+                             String::from(parts[3])))
+    }
 }
 
 impl User {
@@ -368,11 +407,17 @@ impl User {
     fn new_for_key(sync_session_id: String, id: String) -> User {
         User{
             id: id,
+            public_id: String::new(),
             sync_session_id: sync_session_id,
             name: String::from(""),
             role: String::new(),
             last_seen: 0,
         }
+    }
+
+    /// Returns true if the user's role gives them privileged access.
+    fn is_privileged(&self) -> bool {
+        self.role == USER_ROLE_OWNER || self.role == USER_ROLE_ADMIN
     }
 }
 
@@ -460,6 +505,7 @@ async fn create_sync_session(
 
     let user = User{
         id: Uuid::new_v4().to_string(),
+        public_id: Uuid::new_v4().to_string(),
         sync_session_id: String::from(&sess.id),
         name: String::from("Owner"),
         role: String::from(USER_ROLE_OWNER),
@@ -492,20 +538,62 @@ struct GetSyncSessionResp {
     /// Retrieved sync session.
     sync_session: SyncSession,
 
-    /// Users who are part of the sync session.
-    users: Vec<User>,
+    /// Users who are part of the sync session. Keys are public User IDs.
+    users: HashMap<String, User>,
+
+    /// Mapping between public user IDs and private user IDs. Keys are user public
+    /// IDs. Values are user private IDs. Only returned if the user ID in the
+    /// request's Authorization header is an owner or admin. The owner's private ID
+    /// is never returned.
+    user_ids: Option<HashMap<String, String>>,
 }
 
 /// Retrieves a sync session by ID.
 async fn get_sync_session(
     data: web::Data<AppState>,
-    urldata: web::Path<String>
+    urldata: web::Path<String>,
+    req: HttpRequest,
 ) -> impl Responder
 {
     let redis_conn = &mut data.redis_conn.lock().unwrap();
+    let sess_id = urldata.into_inner();
+
+    // Retrieve authorized user if provided
+    let authorized_user = match &req.headers().get(http::header::AUTHORIZATION) {
+        Some(uid_raw) => {
+            let uid = match uid_raw.to_str() {
+                Err(e) => return HttpResponse::InternalServerError().json(
+                    ServerErrorResp::new("Failed to read Authorization \
+                                          header value",
+                                         &format!("{}", e))),
+                Ok(v) => v,
+            };
+            
+            let user_key = User::new_for_key(sess_id.clone(),
+                                             String::from(uid));
+            
+            match load_from_redis::<User, User>(redis_conn, &user_key).await {
+                Err(e) => return HttpResponse::InternalServerError().json(
+                    ServerErrorResp::new("Failed to retrieve information about \
+                                          provided authorize user ID", &e)),
+                Ok(v) => match v {
+                    Some(some_v) => Some(some_v),
+                    None => return HttpResponse::NotFound().json(
+                        UserErrorResp::new(&format!(
+                            "User ID provided as authorize user ID field {} \
+                             does not exist", uid))),
+                },
+            }
+        },
+        None => None,
+    };
+    let authorized_user_privileged = match authorized_user {
+        Some(user) => user.is_privileged(),
+        None => false,
+    };
     
     // Load sync session
-    let sess_key = SyncSession::new_for_key(urldata.into_inner());
+    let sess_key = SyncSession::new_for_key(sess_id.clone());
     
     let sess = match load_from_redis(redis_conn, &sess_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -532,12 +620,13 @@ async fn get_sync_session(
     }
 
     // Retrieve users in sync session
-    let mut sess_users: Vec<User> = Vec::new();
+    let mut sess_users: HashMap<String, User> = HashMap::new();
+    let mut user_ids_mapping: HashMap<String, String> = HashMap::new();
 
     for user_key_str in &sess_users_keys {
         let user_key = StringRedisKey::new(String::from(user_key_str.as_str()));
         
-        let user = match load_from_redis(redis_conn, &user_key).await {
+        let user: User = match load_from_redis(redis_conn, &user_key).await {
             Err(e) => return HttpResponse::InternalServerError().json(
                 ServerErrorResp::new("Failed to retrieve information about one of\
                                       the users in the sync session",
@@ -553,7 +642,25 @@ async fn get_sync_session(
                                   was found via SCAN", user_key_str))),
             },
         };
-        sess_users.push(user);
+
+        let user_public_id = user.public_id.clone();
+        let user_role = user.role.clone();
+        
+        sess_users.insert(user_public_id.clone(), user);
+
+        if authorized_user_privileged && user_role != USER_ROLE_OWNER {
+            let private_user_id = match User::from_key((*user_key_str).clone()) {
+                Err(e) => return HttpResponse::InternalServerError().json(
+                    ServerErrorResp::new(
+                        "Failed to process users in sync session",
+                        &format!("Failed to convert raw Redis key \"{}\" \
+                                  into User struct: {}",
+                                 (*user_key_str).clone(), e))),
+                Ok(v) => v.id,
+            };
+            
+            user_ids_mapping.insert(user_public_id.clone(), private_user_id);
+        }
     }
 
     // Send result
@@ -564,6 +671,10 @@ async fn get_sync_session(
         Some(v) => HttpResponse::Ok().json(GetSyncSessionResp{
             sync_session: v,
             users: sess_users,
+            user_ids: match authorized_user_privileged {
+                true => Some(user_ids_mapping),
+                false => None,
+            },
         }),
     }
 }
@@ -754,6 +865,7 @@ async fn join_sync_session(
     // Create user
     let user = User{
         id: Uuid::new_v4().to_string(),
+        public_id: Uuid::new_v4().to_string(),
         sync_session_id: String::from(&sess.id),
         name: String::from(&req.name),
         role: String::new(),
@@ -812,14 +924,26 @@ async fn leave_sync_session(
     // Check user exists
     let user_key = User::new_for_key(String::from(&url_sess_id),
                                      String::from(&req.user_id));
-    match redis_conn.exists::<String, bool>(user_key.key()).await {
+    let user: User = match load_from_redis(redis_conn, &user_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to check if user exists",
                                  &format!("{}", &e))),
-        Ok(exists) if !exists => return HttpResponse::NotFound().json(
-            UserErrorResp::new(&format!("User {} not found", &req.user_id))),
-        _ => (),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("User {} not found", &req.user_id))),
+        },
     };
+
+    // Ensure user is not the owner, because there always has to be one owner in a
+    // sync session. So before they leave they must transfer ownership to
+    // someone else.
+    if user.role == USER_ROLE_OWNER {
+        return HttpResponse::Conflict().json(
+            UserErrorResp::new("Cannot delete user because they are the owner \
+                                of the sync session. Transfer ownership to \
+                                someone else then try again."));
+    }
 
     // Get sync session
     let sess_key = SyncSession::new_for_key(String::from(url_sess_id.as_str()));
