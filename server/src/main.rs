@@ -277,7 +277,7 @@ impl <'a, T: FromRedisValue> RedisScanStream<'a, T> {
 
 /// A video sync session which holds video state.
 /// Times are the number of non-leap seconds since EPOCH in UTC.
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize,Deserialize,Debug)]
 struct SyncSession {
     /// Identifier, UUIDv4.
     id: String,
@@ -325,7 +325,7 @@ impl SyncSession {
 
 /// User in a sync session.
 /// Times are the number of non-leap seconds since EPOCH in UTC.
-#[derive(Serialize,Deserialize)]
+#[derive(Serialize,Deserialize,Debug)]
 struct User {
     /// Identifier UUIDv4. This value is treated as a secret which only the
     /// user themselves know.
@@ -491,6 +491,7 @@ async fn get_sync_session(
     
     // Load sync session
     let sess_key = SyncSession::new_for_key(urldata.into_inner());
+    debug!("sess_key={:?}", sess_key);
     
     let sess = match load_from_redis(redis_conn, &sess_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -818,7 +819,7 @@ async fn leave_sync_session(
     let mut pipeline = redis::pipe();
     pipeline.atomic();
 
-    pipeline.cmd("DELETE").arg(&user_key.key());
+    pipeline.cmd("DEL").arg(&user_key.key());
 
     match RedisStoreMany::new(&mut pipeline)
         .store(&sess).expire(&sess, REDIS_KEY_TTL)
@@ -1005,14 +1006,20 @@ async fn main() -> std::io::Result<()> {
         Ok(v) => v,
     };
 
+    info!("Connected to Redis");
+
     // Start HTTP server
     let app_state = web::Data::new(AppState{
         redis_conn: Mutex::new(redis_conn),
     });
-    
+
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
+            .default_service(web::route().to(not_found))
+            .wrap(Logger::default())
+            .wrap(ErrorHandlers::new()
+                  .handler(http::StatusCode::BAD_REQUEST, on_bad_request))
             .route("/api/v0/status", web::get().to(server_status))
             .route("/api/v0/sync_session", web::post().to(create_sync_session))
             .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
@@ -1026,12 +1033,8 @@ async fn main() -> std::io::Result<()> {
                    .to(leave_sync_session))
             .route("/api/v0/sync_session/{session_id}/user", web::put()
                    .to(update_sync_session_user))
-            .default_service(web::route().to(not_found))
-            .wrap(Logger::default())
-            .wrap(ErrorHandlers::new()
-                  .handler(http::StatusCode::BAD_REQUEST, on_bad_request))
     })
-        .bind("0.0.0.0:8000")?
+        .bind("127.0.0.1:8000")?
         .run()
         .await
 }
