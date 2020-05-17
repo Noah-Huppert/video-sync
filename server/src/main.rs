@@ -1160,6 +1160,11 @@ async fn main() -> std::io::Result<()> {
         redis_conn: Mutex::new(redis_conn),
     });
 
+    // TODO: Make set user role endpoint
+    // TODO: Make subscribe web socket
+    // TODO: Add privileged sync session metadata field which indicates who can set the play status, any user or privileged users
+    // TODO: Make set privileged sync session metadata endpoint
+
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
