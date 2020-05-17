@@ -24,7 +24,7 @@ const REDIS_KEY_TTL: usize = 86400;
 
 /// HTTP app state.
 struct AppState {
-    /// Asynchronous Redis connection. Preferable to use when possible.
+    /// Asynchronous Redis connection.
     redis_conn: Mutex<MultiplexedConnection>,
 }
 
@@ -56,7 +56,7 @@ impl StringRedisKey {
 
 impl RedisKey for StringRedisKey {
     fn key(&self) -> String {
-        String::from(self.key.as_str())
+        self.key.clone()
     }
 
     fn from_key(redis_key: String) -> Result<Self, String> {
@@ -91,8 +91,8 @@ struct RedisStoreMany<'a> {
     /// Data to store. Keys = Redis key, values = JSON
     data: HashMap<String, String>,
 
-    /// Time to live values for any keys in data. Keys = Redis key,
-    /// values = time to live in seconds.
+    /// Time to live values for key in Redis. Keys = Redis key, values = time to
+    /// live in seconds.
     ttls: HashMap<String, usize>,
 
     /// Errors which occured during serialization in the store() method.
@@ -115,8 +115,10 @@ impl <'a> RedisStoreMany<'a> {
     /// If an error occurs during serialization it is not returned until execute()
     /// so that this method can be chained and called multiple times without error
     /// checking each time.
-    fn store<T: Serialize + RedisKey>(&mut self, data: &T)
-                                      -> &'a mut RedisStoreMany
+    fn store<T: Serialize + RedisKey>(
+        &mut self,
+        data: &T
+    )-> &'a mut RedisStoreMany
     {
         let key = data.key();
 
@@ -143,10 +145,13 @@ impl <'a> RedisStoreMany<'a> {
         self
     }
 
-    /// Serialize items and store in Redis.
-    async fn execute(&mut self, redis_conn: &mut MultiplexedConnection)
-               -> Result<(), String>
+    /// Run store and expire commands on pipeline.
+    async fn execute(
+        &mut self,
+        redis_conn: &mut MultiplexedConnection
+    )-> Result<(), String>
     {
+        // Check for serialization errors
         if self.serialization_errors.len() > 0 {
             let mut error_str = String::from("Serialization errors occurred: ");
 
@@ -164,6 +169,7 @@ impl <'a> RedisStoreMany<'a> {
             return Err(error_str);
         }
 
+        // Add SET and EXPIRE commands to pipeline
         for (key, data_json) in &self.data {
             self.redis_pipeline.cmd("SET").arg(key).arg(data_json);
         }
@@ -172,8 +178,9 @@ impl <'a> RedisStoreMany<'a> {
             self.redis_pipeline.cmd("EXPIRE").arg(key).arg(*ttl);
         }
 
-        match self.redis_pipeline.query_async::<MultiplexedConnection, Vec<String>>(
-            redis_conn).await
+        // Run pipeline
+        match self.redis_pipeline.query_async::<MultiplexedConnection,Vec<String>>
+            (redis_conn).await
         {
             Err(e) => return Err(format!("Failed to execute set pipeline: {}", e)),
             _ => Ok(()),
@@ -299,15 +306,14 @@ struct SyncSession {
     playing: bool,
 
     /// Number of seconds into video when it was the time specified
-    /// by last_updated.
+    /// by timestamp_last_updated.
     timestamp_seconds: i64,
 
     /// Client's time when they updated timestamp_seconds.
     timestamp_last_updated: i64,
 
     /// Last time any information about session was updated, including
-    /// timestamp_seconds This time is the server's time. Since it is only used
-    /// to find old sessions. User updates are not included.
+    /// timestamp_seconds This time is the server's time. 
     last_updated: i64,
 }
 
@@ -330,12 +336,12 @@ impl RedisKey for SyncSession {
 
 impl SyncSession {
     /// Creates a new sync session with only the id field populated. This allows
-    /// the structure to function properly as a RedisKey. All nother fields have
+    /// the structure to function properly as a RedisKey. All other fields have
     /// empty values which should be replaced before use. 
     fn new_for_key(id: String) -> SyncSession {
         SyncSession{
             id: id,
-            name: String::from(""),
+            name: String::new(),
             playing: false,
             timestamp_seconds: 0,
             timestamp_last_updated: 0,
@@ -346,8 +352,8 @@ impl SyncSession {
 
 /// User in a sync session.
 /// Times are the number of non-leap seconds since EPOCH in UTC.
-/// One sync session owner must exist in a sync session at a time. Admins can
-/// see other user's secret IDs. As a result they can rename them and kick them
+/// Exactly one sync session owner must exist in a sync session. Admins can
+/// see other user's secret IDs. As a result they can rename and kick them
 /// from the session. Admins cannot modify owners.
 #[derive(Serialize,Deserialize,Debug)]
 struct User {
@@ -363,11 +369,11 @@ struct User {
     /// Identifier of sync session user belongs to.
     sync_session_id: String,
     
-    /// Friendly name to identify user. Can be the values of USER_ROLE_OWNER
-    /// , USER_ROLE_ADMIN, or empty.
+    /// Friendly name to identify user.
     name: String,
 
-    /// Authorization role attached to user. 
+    /// Authorization role attached to user. Can be the values of USER_ROLE_OWNER,
+    /// USER_ROLE_ADMIN, or empty.
     role: String,
 
     /// Last time the client was seen from the server's perspective.
@@ -409,7 +415,7 @@ impl User {
             id: id,
             public_id: String::new(),
             sync_session_id: sync_session_id,
-            name: String::from(""),
+            name: String::new(),
             role: String::new(),
             last_seen: 0,
         }
@@ -482,7 +488,7 @@ struct CreateSyncSessionResp {
     /// User to be used by client who just created the sync session.
     user: User,
 
-    /// Secret ID of user to be used by client who just crated the sync session.
+    /// Secret ID of user.
     user_id: String,
 }
 
@@ -506,7 +512,7 @@ async fn create_sync_session(
     let user = User{
         id: Uuid::new_v4().to_string(),
         public_id: Uuid::new_v4().to_string(),
-        sync_session_id: String::from(&sess.id),
+        sync_session_id: sess.id.clone(),
         name: String::from("Owner"),
         role: String::from(USER_ROLE_OWNER),
         last_seen: now,
@@ -527,7 +533,7 @@ async fn create_sync_session(
     
     HttpResponse::Ok().json(CreateSyncSessionResp{
         sync_session: sess,
-        user_id: String::from(&user.id),
+        user_id: user.id.clone(),
         user: user,
     })
 }
@@ -575,12 +581,13 @@ async fn get_sync_session(
             match load_from_redis::<User, User>(redis_conn, &user_key).await {
                 Err(e) => return HttpResponse::InternalServerError().json(
                     ServerErrorResp::new("Failed to retrieve information about \
-                                          provided authorize user ID", &e)),
+                                          user associated with \
+                                          authorization credentials", &e)),
                 Ok(v) => match v {
                     Some(some_v) => Some(some_v),
                     None => return HttpResponse::NotFound().json(
                         UserErrorResp::new(&format!(
-                            "User ID provided as authorize user ID field {} \
+                            "User ID provided as authorization \"{}\" \
                              does not exist", uid))),
                 },
             }
@@ -602,7 +609,7 @@ async fn get_sync_session(
     };
 
     // Retrieve keys of users in sync session
-    let sess_users_key = User::new_for_key(String::from(&sess_key.id),
+    let sess_users_key = User::new_for_key(sess_key.id.clone(),
                                            String::from("*"));
     let mut sess_users_keys: Vec<String> = Vec::new();
 
@@ -624,7 +631,7 @@ async fn get_sync_session(
     let mut user_ids_mapping: HashMap<String, String> = HashMap::new();
 
     for user_key_str in &sess_users_keys {
-        let user_key = StringRedisKey::new(String::from(user_key_str.as_str()));
+        let user_key = StringRedisKey::new(user_key_str.clone());
         
         let user: User = match load_from_redis(redis_conn, &user_key).await {
             Err(e) => return HttpResponse::InternalServerError().json(
@@ -717,7 +724,7 @@ async fn update_sync_session_metadata(
     };
 
     if let Some(new_name) = &req.name {
-        sess.name = String::from(new_name);
+        sess.name = new_name.clone();
     } else {
         return HttpResponse::BadRequest().json(
             UserErrorResp::new("Request must contain at least one field \
@@ -866,8 +873,8 @@ async fn join_sync_session(
     let user = User{
         id: Uuid::new_v4().to_string(),
         public_id: Uuid::new_v4().to_string(),
-        sync_session_id: String::from(&sess.id),
-        name: String::from(&req.name),
+        sync_session_id: sess.id.clone(),
+        name: req.name.clone(),
         role: String::new(),
         last_seen: Utc::now().timestamp(),
     };
@@ -892,7 +899,7 @@ async fn join_sync_session(
 
     HttpResponse::Ok().json(JoinSyncSessionResp{
         sync_session: sess,
-        user_id: String::from(user.id.as_str()),
+        user_id: user.id.clone(),
         user: user,
     })
 }
@@ -922,8 +929,8 @@ async fn leave_sync_session(
     let url_sess_id = urldata.into_inner();
     
     // Check user exists
-    let user_key = User::new_for_key(String::from(&url_sess_id),
-                                     String::from(&req.user_id));
+    let user_key = User::new_for_key(url_sess_id.clone(),
+                                     req.user_id.clone());
     let user: User = match load_from_redis(redis_conn, &user_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to check if user exists",
@@ -946,7 +953,7 @@ async fn leave_sync_session(
     }
 
     // Get sync session
-    let sess_key = SyncSession::new_for_key(String::from(url_sess_id.as_str()));
+    let sess_key = SyncSession::new_for_key(url_sess_id.clone());
 
     let mut sess: SyncSession = match load_from_redis(redis_conn, &sess_key).await
     {
@@ -1011,8 +1018,8 @@ async fn update_sync_session_user(
     let url_sess_id = urldata.into_inner();
 
     // Get user
-    let user_key = User::new_for_key(String::from(url_sess_id.as_str()),
-                                     String::from(req.user_id.as_str()));
+    let user_key = User::new_for_key(url_sess_id.clone(),
+                                     req.user_id.clone());
     let mut user: User = match load_from_redis(
         &mut data.redis_conn.lock().unwrap(), &user_key).await
     {
@@ -1028,7 +1035,7 @@ async fn update_sync_session_user(
     };
 
     // Get sync session
-    let sess_key = SyncSession::new_for_key(String::from(url_sess_id.as_str()));
+    let sess_key = SyncSession::new_for_key(url_sess_id.clone());
     
     let mut sess: SyncSession = match load_from_redis(
         &mut data.redis_conn.lock().unwrap(), &sess_key).await
@@ -1046,8 +1053,8 @@ async fn update_sync_session_user(
     };
 
     // Update user
-    user.id = String::from(req.user_id.as_str());
-    user.name = String::from(req.name.as_str());
+    user.id = req.user_id.clone();
+    user.name = req.name.clone();
     user.last_seen = Utc::now().timestamp();
 
     sess.last_updated = Utc::now().timestamp();
