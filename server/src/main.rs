@@ -694,6 +694,13 @@ async fn update_sync_session_status(
     })
 }
 
+/// Request for join sync session endpoint.
+#[derive(Deserialize)]
+struct JoinSyncSessionReq {
+    /// Name of user joining.
+    name: String,
+}
+
 /// Response of join sync session endpoint.
 #[derive(Serialize)]
 struct JoinSyncSessionResp {
@@ -711,6 +718,7 @@ struct JoinSyncSessionResp {
 async fn join_sync_session(
     data: web::Data<AppState>,
     urldata: web::Path<String>,
+    req: web::Json<JoinSyncSessionReq>,
 ) -> impl Responder
 {
     // Get sync session
@@ -733,7 +741,7 @@ async fn join_sync_session(
     let user = User{
         id: Uuid::new_v4().to_string(),
         sync_session_id: String::from(&sess.id),
-        name: String::from("Alice"),
+        name: String::from(&req.name),
         last_seen: Utc::now().timestamp(),
     };
 
