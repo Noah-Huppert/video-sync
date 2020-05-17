@@ -325,6 +325,9 @@ impl SyncSession {
 
 /// User in a sync session.
 /// Times are the number of non-leap seconds since EPOCH in UTC.
+/// One sync session owner must exist in a sync session at a time. Admins can
+/// see other user's secret IDs. As a result they can rename them and kick them
+/// from the session. Admins cannot modify owners.
 #[derive(Serialize,Deserialize,Debug)]
 struct User {
     /// Identifier UUIDv4. This value is treated as a secret which only the
@@ -335,12 +338,22 @@ struct User {
     /// Identifier of sync session user belongs to.
     sync_session_id: String,
     
-    /// Friendly name to identify user.
+    /// Friendly name to identify user. Can be the values of USER_ROLE_OWNER
+    /// , USER_ROLE_ADMIN, or empty.
     name: String,
+
+    /// Authorization role attached to user. 
+    role: String,
 
     /// Last time the client was seen from the server's perspective.
     last_seen: i64,
 }
+
+/// Indicates a user is an owner.
+const USER_ROLE_OWNER: &str = "owner";
+
+/// Indicates a user is an admin.
+const USER_ROLE_ADMIN: &str = "admin";
 
 impl RedisKey for User {
     fn key(&self) -> String {
@@ -357,6 +370,7 @@ impl User {
             id: id,
             sync_session_id: sync_session_id,
             name: String::from(""),
+            role: String::new(),
             last_seen: 0,
         }
     }
@@ -447,7 +461,8 @@ async fn create_sync_session(
     let user = User{
         id: Uuid::new_v4().to_string(),
         sync_session_id: String::from(&sess.id),
-        name: String::from("Admin"),
+        name: String::from("Owner"),
+        role: String::from(USER_ROLE_OWNER),
         last_seen: now,
     };
 
@@ -491,7 +506,6 @@ async fn get_sync_session(
     
     // Load sync session
     let sess_key = SyncSession::new_for_key(urldata.into_inner());
-    debug!("sess_key={:?}", sess_key);
     
     let sess = match load_from_redis(redis_conn, &sess_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -742,6 +756,7 @@ async fn join_sync_session(
         id: Uuid::new_v4().to_string(),
         sync_session_id: String::from(&sess.id),
         name: String::from(&req.name),
+        role: String::new(),
         last_seen: Utc::now().timestamp(),
     };
 
