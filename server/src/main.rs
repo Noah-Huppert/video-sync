@@ -115,12 +115,13 @@ impl <'a> RedisStoreMany<'a> {
     /// If an error occurs during serialization it is not returned until execute()
     /// so that this method can be chained and called multiple times without error
     /// checking each time.
-    fn store<T: Serialize + RedisKey>(
+    fn store<T: Serialize, K: RedisKey>(
         &mut self,
-        data: &T
-    )-> &'a mut RedisStoreMany
+        key_obj: &K,
+        data: &T,
+    ) -> &mut Self
     {
-        let key = data.key();
+        let key = key_obj.key();
 
         let json = match serde_json::to_string(data) {
             Err(e) => {
@@ -137,8 +138,7 @@ impl <'a> RedisStoreMany<'a> {
 
     /// Sets a key's expiration time to live in seconds. Included in this struct
     /// because setting a key clears any existing TTL.
-    fn expire<T: RedisKey>(&mut self, key: &T, ttl: usize)
-                           -> &'a mut RedisStoreMany
+    fn expire<T: RedisKey>(&mut self, key: &T, ttl: usize) -> &mut Self
     {
         self.ttls.insert(key.key(), ttl);
 
@@ -429,31 +429,31 @@ impl User {
 
 /// Response which all 5xx responses use.
 #[derive(Serialize)]
-struct ServerErrorResp<'a> {
+struct ServerErrorResp {
     /// Public error message.
-    error: &'a str,
+    error: String
 }
 
-impl <'a> ServerErrorResp<'a> {
-    fn new(public_error: &'a str, internal_error: &'a str) -> ServerErrorResp<'a> {
+impl ServerErrorResp {
+    fn new(public_error: &str, internal_error: &str) -> ServerErrorResp {
         error!("public error={}, internal error={}", public_error, internal_error);
         ServerErrorResp{
-            error: public_error,
+            error: String::from(public_error),
         }
     }
 }
 
 /// Response which all 4xx responses use.
 #[derive(Serialize)]
-struct UserErrorResp<'a> {
+struct UserErrorResp {
     /// User error message.
-    error: &'a str,
+    error: String
 }
 
-impl <'a> UserErrorResp<'a> {
-    fn new(error: &'a str) -> UserErrorResp<'a> {
+impl UserErrorResp {
+    fn new(error: &str) -> UserErrorResp {
         UserErrorResp{
-            error: error,
+            error: String::from(error),
         }
     }
 }
@@ -522,8 +522,8 @@ async fn create_sync_session(
     redis_pipeline.atomic();
 
     match RedisStoreMany::new(&mut redis_pipeline)
-        .store(&sess).expire(&sess, REDIS_KEY_TTL)
-        .store(&user).expire(&user, REDIS_KEY_TTL)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&user, &user).expire(&user, REDIS_KEY_TTL)
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -554,7 +554,8 @@ struct GetSyncSessionResp {
     user_ids: Option<HashMap<String, String>>,
 }
 
-/// Retrieves a sync session by ID.
+/// Retrieves a sync session by ID. A user ID can be passed in the Authorization
+/// header to retrieve privileged information.
 async fn get_sync_session(
     data: web::Data<AppState>,
     urldata: web::Path<String>,
@@ -565,47 +566,36 @@ async fn get_sync_session(
     let sess_id = urldata.into_inner();
 
     // Retrieve authorized user if provided
-    let authorized_user = match &req.headers().get(http::header::AUTHORIZATION) {
-        Some(uid_raw) => {
-            let uid = match uid_raw.to_str() {
-                Err(e) => return HttpResponse::InternalServerError().json(
-                    ServerErrorResp::new("Failed to read Authorization \
-                                          header value",
-                                         &format!("{}", e))),
-                Ok(v) => v,
-            };
-            
-            let user_key = User::new_for_key(sess_id.clone(),
-                                             String::from(uid));
-            
-            match load_from_redis::<User, User>(redis_conn, &user_key).await {
-                Err(e) => return HttpResponse::InternalServerError().json(
-                    ServerErrorResp::new("Failed to retrieve information about \
-                                          user associated with \
-                                          authorization credentials", &e)),
-                Ok(v) => match v {
-                    Some(some_v) => Some(some_v),
-                    None => return HttpResponse::NotFound().json(
-                        UserErrorResp::new(&format!(
-                            "User ID provided as authorization \"{}\" \
-                             does not exist", uid))),
-                },
-            }
+    let authorized_user = match get_authorized_user(&req, redis_conn,
+                                                    sess_id.clone()).await
+    {
+        Err(e) => match e {
+            GetAuthUserError::ServerError(e) =>
+                return HttpResponse::InternalServerError().json(e),
+            GetAuthUserError::NotFound(e) =>
+                return HttpResponse::NotFound().json(e),
         },
-        None => None,
+        Ok(v) => v,
     };
+
     let authorized_user_privileged = match authorized_user {
         Some(user) => user.is_privileged(),
         None => false,
     };
-    
+
+
     // Load sync session
     let sess_key = SyncSession::new_for_key(sess_id.clone());
-    
-    let sess = match load_from_redis(redis_conn, &sess_key).await {
+
+    let sess: SyncSession = match load_from_redis(redis_conn, &sess_key).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to get sync session", &e)),
-        Ok(v) => v,
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            &sess_key.id))),
+        },
     };
 
     // Retrieve keys of users in sync session
@@ -671,19 +661,14 @@ async fn get_sync_session(
     }
 
     // Send result
-    match sess {
-        None => HttpResponse::NotFound().json(
-            UserErrorResp::new(&format!("Sync session {} not found",
-                                        &sess_key.id))),
-        Some(v) => HttpResponse::Ok().json(GetSyncSessionResp{
-            sync_session: v,
-            users: sess_users,
-            user_ids: match authorized_user_privileged {
-                true => Some(user_ids_mapping),
-                false => None,
-            },
-        }),
-    }
+    HttpResponse::Ok().json(GetSyncSessionResp{
+        sync_session: sess,
+        users: sess_users,
+        user_ids: match authorized_user_privileged {
+            true => Some(user_ids_mapping),
+            false => None,
+        },
+    })
 }
 
 /// Update sync session metadata request.
@@ -737,7 +722,7 @@ async fn update_sync_session_metadata(
     redis_pipeline.atomic();
 
     match RedisStoreMany::new(&mut redis_pipeline)
-        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -812,7 +797,7 @@ async fn update_sync_session_status(
     pipeline.atomic();
 
     match RedisStoreMany::new(&mut pipeline)
-        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
         .execute(&mut data.redis_conn.lock().unwrap()).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to save updated sync session", &e)),
@@ -886,8 +871,8 @@ async fn join_sync_session(
     pipeline.atomic();
 
     match RedisStoreMany::new(&mut pipeline)
-        .store(&user).expire(&user, REDIS_KEY_TTL)
-        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&user, &user).expire(&user, REDIS_KEY_TTL)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -976,7 +961,7 @@ async fn leave_sync_session(
     pipeline.cmd("DEL").arg(&user_key.key());
 
     match RedisStoreMany::new(&mut pipeline)
-        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
         .execute(redis_conn).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -1063,8 +1048,8 @@ async fn update_sync_session_user(
     redis_pipeline.atomic();
 
     match RedisStoreMany::new(&mut redis_pipeline)
-        .store(&user).expire(&user, REDIS_KEY_TTL)
-        .store(&sess).expire(&sess, REDIS_KEY_TTL)
+        .store(&user, &user).expire(&user, REDIS_KEY_TTL)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
         .execute(&mut data.redis_conn.lock().unwrap()).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -1079,6 +1064,162 @@ async fn update_sync_session_user(
     })
 }
 
+/// Request for update sync session user role endpoint.
+#[derive(Deserialize)]
+struct UpdateSyncSessUserRoleReq {
+    /// ID of user for which role will be set.
+    user_id: String,
+
+    /// New role value for user.
+    role: String,
+}
+
+/// Response of update sync session user role endpoint.
+#[derive(Serialize)]
+struct UpdateSyncSessUserRoleResp {
+    /// New state of requester user.
+    requester_user: User,
+
+    /// New state of target user.
+    target_user: User,
+}
+
+/// Update a user's role. A user ID must be passed in the Authorization header
+/// to authenticate. Only owners or admins can change user roles. Only owners can
+/// make another user an owner, and doing so makes the requester an admin.
+async fn update_sync_session_user_role(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+    req: HttpRequest,
+    req_body: web::Json<UpdateSyncSessUserRoleReq>,
+) -> impl Responder
+{
+    let redis_conn = &mut data.redis_conn.lock().unwrap();
+    let sess_key = SyncSession::new_for_key(urldata.into_inner());
+
+    // Get authorized user
+    let mut authorized_user = match get_authorized_user(&req, redis_conn,
+                                                        sess_key.id.clone()).await
+    {
+        Err(e) => match e {
+            GetAuthUserError::ServerError(e) =>
+                return HttpResponse::InternalServerError().json(e),
+            GetAuthUserError::NotFound(e) =>
+                return HttpResponse::NotFound().json(e),
+        },
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::Unauthorized().json(
+                UserErrorResp::new("Failed to authenticate, user with ID does \
+                                    not exist")),
+        },
+    };
+
+    // Ensure user is privileged
+    if !authorized_user.is_privileged() {
+        return HttpResponse::Unauthorized().json(
+            UserErrorResp::new("You do not have the proper permissions to \
+                                perform this action"));
+    }
+
+    // Ensure request body role value is valid
+    if &req_body.role != USER_ROLE_OWNER && &req_body.role != USER_ROLE_ADMIN {
+        return HttpResponse::BadRequest().json(
+            UserErrorResp::new(&format!("role field must be either \"{}\" \
+                                         or \"{}\"", USER_ROLE_OWNER,
+                                        USER_ROLE_ADMIN)));
+    }
+
+    // Ensure that the requester is not an owner tweaking their own role. As this
+    // could leave a sync session without an owner.
+    if &authorized_user.role == USER_ROLE_OWNER &&
+        &req_body.user_id == &authorized_user.id
+    {
+        return HttpResponse::BadRequest().json(
+            UserErrorResp::new("Owners cannot update their own role. If you are \
+                                trying to remove your owner role you must make \
+                                another user an owner first."));
+    }
+
+    // Ensure that if making a user an owner the requester is an owner
+    if &req_body.role == USER_ROLE_OWNER &&
+        &authorized_user.role != USER_ROLE_OWNER
+    {
+        return HttpResponse::Unauthorized().json(
+            UserErrorResp::new("Only owners can promote users to owners"));
+    }
+
+    // Get sync session user belongs to
+    let mut sess: SyncSession = match load_from_redis(redis_conn,
+                                                      &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to retrieve sync session which users \
+                                  are part of", &e)),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            &sess_key.id))),
+        },
+    };
+
+    // Get user who we are updating for which we are updating the role
+    let update_user_key = User::new_for_key(sess_key.id.clone(),
+                                            req_body.user_id.clone());
+    let mut update_user: User = match load_from_redis(redis_conn,
+                                                      &update_user_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to retrieve user to update", &e)),
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("User specified to update, with \
+                                             ID {}, was not found",
+                                            &req_body.user_id))),
+        },
+    };
+
+    let mut pipeline = redis::pipe();
+    pipeline.atomic();
+
+    let mut store_many = RedisStoreMany::new(&mut pipeline);
+
+    update_user.role = req_body.role.clone();
+
+    store_many
+        .store(&update_user_key, &update_user)
+        .expire(&update_user_key, REDIS_KEY_TTL);
+
+    // Update requester (who is an owner) if we are promoting someone to owner
+    if &req_body.role == USER_ROLE_OWNER {
+        authorized_user.role = String::from(USER_ROLE_ADMIN);
+
+        store_many
+            .store(&authorized_user, &authorized_user)
+            .expire(&authorized_user, REDIS_KEY_TTL);
+    }
+
+    // Update session
+    sess.last_updated = Utc::now().timestamp();
+    
+    store_many
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL);
+
+    // Execute updates
+    match store_many.execute(redis_conn).await {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to update users", &e)),
+        _ => (),
+    };
+
+    HttpResponse::Ok().json(UpdateSyncSessUserRoleResp{
+        requester_user: authorized_user,
+        target_user: update_user,
+    })
+}
+
 /// Default handler when no registered routes match a request.
 async fn not_found(_req: HttpRequest) -> impl Responder
 {
@@ -1089,6 +1230,24 @@ fn on_bad_request<B>(
     mut res: ServiceResponse<B>
 ) -> actix_web::Result<ErrorHandlerResponse<B>>
 {
+    match res.headers().get(http::header::CONTENT_TYPE) {
+        Some(header) => match header.to_str() {
+            Err(e) => {
+                error!("In bad request error middleware, failed to read response \
+                        Content-Type header, will treat is if not set: {}", e);
+            },
+            Ok(v) => {
+                if v == "application/json" {
+                    return Ok(ErrorHandlerResponse::Response(res));
+                }
+                warn!("In bad request error middleware, got bad request response \
+                       with content type={}, should always be application/json",
+                      v);
+            }
+        },
+        _ => (),
+    };
+    
     let error_str: String = match res.response().error() {
         Some(e) => format!("{}", e),
         None => String::from("Bad request"),
@@ -1117,6 +1276,55 @@ fn on_bad_request<B>(
     });
 
     Ok(ErrorHandlerResponse::Response(new_res))
+}
+
+/// Identifies error returned by get_authorized_user().
+enum GetAuthUserError {
+    ServerError(ServerErrorResp),
+    NotFound(UserErrorResp),
+}
+
+/// Retrieves the user who's ID is in the Authorization header. The returned
+/// user will have its id field set (which is unusual for users retrieved from
+/// Redis) so that the caller can know the value of the Authoriation header.
+async fn get_authorized_user(
+    req: &HttpRequest,
+    redis_conn: &mut MultiplexedConnection,
+    sess_id: String,
+) -> Result<Option<User>, GetAuthUserError>
+{
+    match req.headers().get(http::header::AUTHORIZATION) {
+        Some(uid_raw) => {
+            let uid = match uid_raw.to_str() {
+                Err(e) => return Err(GetAuthUserError::ServerError(
+                    ServerErrorResp::new(
+                        "Failed to read Authorization header value",
+                        &format!("{}", e)))),
+                Ok(v) => v,
+            };
+            
+            let user_key = User::new_for_key(sess_id.clone(),
+                                             String::from(uid));
+            
+            match load_from_redis::<User, User>(redis_conn, &user_key).await {
+                Err(e) => return Err(GetAuthUserError::ServerError(
+                    ServerErrorResp::new(
+                        "Failed to retrieve information about user associated \
+                         with authorization credentials", &e))),
+                Ok(v) => match v {
+                    Some(mut some_v) => {
+                        some_v.id = user_key.id.clone();
+                        Ok(Some(some_v))
+                    },
+                    None => return Err(GetAuthUserError::NotFound(
+                        UserErrorResp::new(&format!(
+                        "User ID provided as authorization \"{}\" \
+                         does not exist", uid)))),
+                },
+            }
+        },
+        None => Ok(None),
+    }
 }
 
 /// Creates a plain and async Redis connection and sends a ping commands to test
@@ -1167,7 +1375,6 @@ async fn main() -> std::io::Result<()> {
         redis_conn: Mutex::new(redis_conn),
     });
 
-    // TODO: Make set user role endpoint
     // TODO: Make subscribe web socket
     // TODO: Add privileged sync session metadata field which indicates who can set the play status, any user or privileged users
     // TODO: Make set privileged sync session metadata endpoint
@@ -1190,8 +1397,10 @@ async fn main() -> std::io::Result<()> {
                    .to(join_sync_session))
             .route("/api/v0/sync_session/{id}/user", web::delete()
                    .to(leave_sync_session))
-            .route("/api/v0/sync_session/{session_id}/user", web::put()
+            .route("/api/v0/sync_session/{id}/user", web::put()
                    .to(update_sync_session_user))
+            .route("/api/v0/sync_session/{id}/user/role", web::put()
+                   .to(update_sync_session_user_role))
     })
         .bind("127.0.0.1:8000")?
         .run()
