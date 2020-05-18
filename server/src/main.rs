@@ -302,6 +302,9 @@ struct SyncSession {
     /// Name of session.
     name: String,
 
+    /// Indicates if users must be privileged to set playback metadata.
+    set_playback_requires_privileges: bool,
+
     /// If video is running.
     playing: bool,
 
@@ -342,6 +345,7 @@ impl SyncSession {
         SyncSession{
             id: id,
             name: String::new(),
+            set_playback_requires_privileges: false,
             playing: false,
             timestamp_seconds: 0,
             timestamp_last_updated: 0,
@@ -503,6 +507,7 @@ async fn create_sync_session(
     let sess = SyncSession{
         id: Uuid::new_v4().to_string(),
         name: req.name.clone(),
+        set_playback_requires_privileges: false,
         playing: false,
         timestamp_seconds: 0,
         timestamp_last_updated: now,
@@ -756,17 +761,21 @@ struct UpdateSyncSessionStatusResp {
 }
 
 /// Updates a sync session's playback status. Triggers sending an update message
-/// on the play status web socket.
-async fn update_sync_session_status(
+/// on the play status web socket. Authorization may be required if the sync
+/// session's set_playback_requires_privileges field is true.
+async fn update_sync_session_playback(
     data: web::Data<AppState>,
     urldata: web::Path<String>,
-    req: web::Json<UpdateSyncSessionStatusReq>,
+    req: HttpRequest,
+    req_data: web::Json<UpdateSyncSessionStatusReq>,
 ) -> impl Responder
 {
+    let redis_conn = &mut data.redis_conn.lock().unwrap();
+    
     // Get session to update
     let mut sess = SyncSession::new_for_key(urldata.to_string());
 
-    sess = match load_from_redis(&mut data.redis_conn.lock().unwrap(),
+    sess = match load_from_redis(redis_conn,
                                  &sess).await
     {
         Err(e) => return HttpResponse::InternalServerError().json(
@@ -779,18 +788,44 @@ async fn update_sync_session_status(
         },
     };
 
+    // Authenticate user if required
+    if sess.set_playback_requires_privileges {
+        match get_authorized_user(&req, redis_conn, sess.id.clone()).await {
+            Err(e) => match e {
+                GetAuthUserError::ServerError(e) =>
+                    return HttpResponse::InternalServerError().json(e),
+                GetAuthUserError::NotFound(e) =>
+                    return HttpResponse::NotFound().json(e),
+            },
+            Ok(v) => match v {
+                Some(user) => {
+                    if !user.is_privileged() {
+                        return HttpResponse::Unauthorized().json(
+                            UserErrorResp::new("You do not have permission to \
+                                                perform this action"));
+                    }
+                },
+                None => {
+                    return HttpResponse::Unauthorized().json(
+                        UserErrorResp::new("User with ID provided in \
+                                            Authorization header does not exist"));
+                },
+            },
+        };
+    }
+
     // Update and store
-    if &req.timestamp_last_updated <= &sess.timestamp_last_updated {
+    if &req_data.timestamp_last_updated <= &sess.timestamp_last_updated {
         return HttpResponse::Conflict().json(
             UserErrorResp::new(&format!("Sync session status has been updated \
                                          more recently than the submitted \
                                          request at {}",
-                                        &req.timestamp_last_updated)));
+                                        &req_data.timestamp_last_updated)));
     }
     
-    sess.playing = req.playing;
-    sess.timestamp_seconds = req.timestamp_seconds;
-    sess.timestamp_last_updated = req.timestamp_last_updated;
+    sess.playing = req_data.playing;
+    sess.timestamp_seconds = req_data.timestamp_seconds;
+    sess.timestamp_last_updated = req_data.timestamp_last_updated;
     sess.last_updated = Utc::now().timestamp();
 
     let mut pipeline = redis::pipe();
@@ -798,7 +833,7 @@ async fn update_sync_session_status(
 
     match RedisStoreMany::new(&mut pipeline)
         .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
-        .execute(&mut data.redis_conn.lock().unwrap()).await {
+        .execute(redis_conn).await {
         Err(e) => return HttpResponse::InternalServerError().json(
             ServerErrorResp::new("Failed to save updated sync session", &e)),
         _ => (),
@@ -1391,8 +1426,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
             .route("/api/v0/sync_session/{id}/metadata", web::put()
                    .to(update_sync_session_metadata))
-            .route("/api/v0/sync_session/{id}/status", web::put()
-                   .to(update_sync_session_status))
+            .route("/api/v0/sync_session/{id}/playback", web::put()
+                   .to(update_sync_session_playback))
             .route("/api/v0/sync_session/{id}/user", web::post()
                    .to(join_sync_session))
             .route("/api/v0/sync_session/{id}/user", web::delete()
