@@ -25,6 +25,9 @@ Then run the API server:
 cargo run
 ```
 
+The `api-repl` script provides a terminal interface to the API which can be used
+for manual testing.
+
 # Redis
 Used as a data store and message bus.
 
