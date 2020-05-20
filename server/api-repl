@@ -75,11 +75,12 @@ Commands:
     redis <...>                      Runs <...> in the Redis CLI.
     get_contexts <resource>          List the contexts available for a resource, 
                                      if none specified defaults to all resources.
-    set_context <resource> <id>      Set the context for a resource
+    use_context <resource> <id>      Set the context for a resource
     clear_contexts [<resource> <id>] Remove all contexts for a resource, if none 
                                      specified defaults to clearing all resources
     get_config <key>                 Get a REPL configuration key
     set_config <key> <value>         Set a REPL configuration key
+    clean                            Deletes all CLI config, context, and history
 EOF
 }
 
@@ -127,17 +128,24 @@ function add_context() { # ( resource, value ), STDOUT = context ID
     resource="$1"
     value="$2"
 
+    # Get next ID for context
     next_id=0
     while read -r id; do
 	   if [ -z "$id" ]; then
 		  continue
 	   fi
+	   
 	   if (($id >= $next_id)); then
 		  next_id=$(($id + 1))
 	   fi
     done <<<$(ls "$wrk_dir/$resource")
 
-    echo "$value" > "$wrk_dir/$resource/$next_id"
+    # Make directory
+    dir="$wrk_dir/$resource/$next_id"
+    mkdir -p "$dir"
+    
+    echo "$value" > "$dir/value"
+    touch "$dir/notes"
 
     set_default_context "$resource" "$next_id"
 
@@ -163,11 +171,21 @@ function get_default_context_id() { # ( resource ), STDOUT = context ID
     fi
 }
 
-function get_context() { # ( resource, ID ), STDOUT = value
+function get_context() { # ( resource, ID, part ), STDOUT = value
     resource="$1"
     id="$2"
+    part="$3"
 
-    cat "$wrk_dir/$resource/$id"
+    cat "$wrk_dir/$resource/$id/$part"
+}
+
+function set_context() { # ( resource, ID, part, value )
+    resource="$1"
+    id="$2"
+    part="$3"
+    value="$4"
+
+    echo "$value" > "$wrk_dir/$resource/$id/$part"
 }
 
 function get_config() { # ( key, default ), STDOUT = value
@@ -196,6 +214,33 @@ function ensure_wrk_dir() { # ()
     fi
 }
 
+function api_call() { # ( method, path, [options...] )
+    # Sets the header and body variables to the result
+    method="$1"
+    shift
+    path="$1"
+    shift
+    options="$@"
+
+    echo "HTTP $(echo $method | tr '[[:lower:]]' '[[:upper:]]') $api_url$path"
+    echo "Authorization: $user_id"
+    echo "$options"
+    
+    resp=$(http -p bh "$method" "$api_url$path" "Authorization: $user_id" $options)
+    header=$(extract_from_resp "$resp" header)
+    body=$(extract_from_resp "$resp" json)
+    
+    if [[ "$?" != "0" ]]; then
+	   echo "$method $path failed"
+	   echo "$resp"
+	   return 1
+    elif [[ $(echo "$header" | head -n 1 | cut -d ' ' -f 2) != "200" ]]; then
+	   echo "$method $path failed"
+	   echo "$resp"
+	   return 1
+    fi
+}
+
 # Check for dependencies
 missing_bins=()
 for bin in http jq python3 date rlwrap; do
@@ -221,7 +266,7 @@ sync_session_ctx=$(get_default_context_id sync_session)
 sync_session_id=""
 
 if [ -n "$sync_session_ctx" ]; then
-    sync_session_id=$(get_context sync_session "$sync_session_ctx")
+    sync_session_id=$(get_context sync_session "$sync_session_ctx" value)
     echo "Current sync session context: \"$sync_session_ctx\""
     echo "Sync session ID: \"$sync_session_id\""
 fi
@@ -230,7 +275,7 @@ user_ctx=$(get_default_context_id user)
 user_id=""
 
 if [ -n "$user_ctx" ]; then
-    user_id=$(get_context user "$user_ctx")
+    user_id=$(get_context user "$user_ctx" value)
     echo
     echo "Current user context: \"$user_ctx\""
     echo "User ID: \"$user_id\""
@@ -250,14 +295,16 @@ function read_tokens() {
 		update
 		redis
 		get_contexts
-		set_context
+		use_context
 		clear_contexts
 		get_config
-		set_config)
+		set_config
+		clean)
+
     tokens=$(rlwrap \
 			  -f <(echo "${cmds[@]}") \
-			  -P '> ' \
 			  -H "$prog_dir/.api-repl/history" \
+			  -S '> ' \
 			  -o \
 			  cat)
     if [[ "$?" != "0" ]]; then
@@ -265,7 +312,6 @@ function read_tokens() {
     fi
 
     tokens=($tokens)
-    tokens=(${tokens[@]:1})
 }
 
 while read_tokens; do
@@ -289,17 +335,11 @@ while read_tokens; do
 		  
 		  case "$resource" in
 			 sync_session|s)
-				resp=$(http -p bh post "$api_url/api/v0/sync_session" name="$name")
-				if [[ "$?" != "0" ]]; then
+				if ! api_call post "/api/v0/sync_session" name="$name"; then
 				    echo "Failed to create sync session"
-				    echo "$resp"
-
 				    continue
 				fi
 				
-				header=$(extract_from_resp "$resp" header)
-				body=$(extract_from_resp "$resp" json)
-
 				sync_session_id=$(echo "$body" | jq .sync_session.id | remove_quotes)
 				user_id=$(echo "$body" | jq .user_id | remove_quotes)
 
@@ -333,21 +373,10 @@ while read_tokens; do
 				    continue
 				fi
 
-			     req_url="$api_url/api/v0/sync_session/$sync_session_id"
-				if [ -n "$user_id" ]; then
-				    resp=$(http -p bh "$req_url" "Authorization: $user_id")
-				else
-				    resp=$(http -p bh "$req_url")
-				fi
-				
-				if [[ "$?" != "0" ]]; then
+				if ! api_call get "/api/v0/sync_session/$sync_session_id"; then
 				    echo "Failed to get sync session"
-				    echo "$resp"
-				    
 				    continue
 				fi
-
-				body=$(extract_from_resp "$resp" json)
 
 				echo "Sync session:"
 				echo "$body" | pretty_json
@@ -370,19 +399,14 @@ while read_tokens; do
 			 continue
 		  fi
 
-		  resp=$(http -p bh post "$api_url/api/v0/sync_session/$sync_session_id/user" name="$name")
-		  if [[ "$?" != "0" ]]; then
+		  if ! api_call post "/api/v0/sync_session/$sync_session_id/user" name="$name";then 
 			 echo "Failed to join sync session"
-			 echo "$resp"
-			 
 			 continue
 		  fi
 		  
-		  header=$(extract_from_resp "$resp" header)
-		  body=$(extract_from_resp "$resp" json)
-
 		  user_id=$(echo "$body" | jq .user_id | remove_quotes)
-		  user_ctx=$(add_context "user" "$user_id")
+		  user_ctx=$(add_context user "$user_id")
+		  set_context user "$user_ctx" notes "Joined"
 
 		  echo "Join sync session:"
 		  echo "    User ID: $user_id"
@@ -401,13 +425,12 @@ while read_tokens; do
 			 continue
 		  fi
 
-		  resp=$(http -p bh delete "$api_url/api/v0/sync_session/$sync_session_id/user" user="$user_id")
-		  if [[ "$?" != "0" ]]; then
+		  if ! api_call delete "/api/v0/sync_session/$sync_session_id/user" user="$user_id"; then
 			 echo "Failed to leave sync session"
-			 echo "$resp"
-			 
 			 continue
 		  fi
+
+		  set_context user "$user_ctx" notes "Left"
 
 		  user_id=""
 		  user_ctx=""
@@ -436,11 +459,8 @@ while read_tokens; do
 				    continue
 				fi
 
-				resp=$(http -p bh put "$api_url/api/v0/sync_session/$sync_session_id/metadata" name="$name")
-				if [[ "$?" != "0" ]]; then
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/metadata" name="$name"; then
 				    echo "Failed to set sync session metadata"
-				    echo "$resp"
-
 				    continue
 				fi
 
@@ -481,11 +501,8 @@ while read_tokens; do
 				    continue
 				fi
 
-				resp=$(http -p bh put "$api_url/api/v0/sync_session/$sync_session_id/playback" playing:="$playing" timestamp_seconds="$timestamp_seconds" timestamp_last_updated="$timestamp_last_updated")
-				if [[ "$?" != "0" ]]; then
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/playback" playing:="$playing" timestamp_seconds="$timestamp_seconds" timestamp_last_updated="$timestamp_last_updated"; then
 				    echo "Failed to update sync session playback"
-				    echo "$resp"
-
 				    continue
 				fi
 
@@ -510,11 +527,8 @@ while read_tokens; do
 				    continue
 				fi
 
-				resp=$(http -p bh put "$api_url/api/v0/sync_session/$sync_session_id/user" user_id="$user_id" name="$name")
-				if [[ "$?" != "0" ]]; then
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/user" user_id="$user_id" name="$name"; then
 				    echo "Failed to update user"
-				    echo "$resp"
-				    
 				    continue
 				fi
 
@@ -558,11 +572,8 @@ while read_tokens; do
 				    user_id=$(cat "$ctx_file")
 				fi
 
-				resp=$(http -p bh put "$api_url/api/v0/sync_session/$sync_session_id/user/role" user_id="$user_id" role="$role")
-				if [[ "$?" != "0" ]]; then
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/user/role" user_id="$user_id" role="$role"; then
 				    echo "Failed to set user role"
-				    echo "$resp"
-
 				    continue
 				fi
 
@@ -578,9 +589,7 @@ while read_tokens; do
 		  esac
 		  ;;
 	   redis)
-		  set -x
 		  CONTAINER_CLI=$container_cli "$prog_dir/redis" cli "${tokens[@]:1}"
-		  set +x
 		  ;;
 	   get_contexts)
 		  resource_arg="${tokens[1]}"
@@ -592,8 +601,13 @@ while read_tokens; do
 			 resources+=("sync_session" "user")
 		  fi
 
+		  after_first_resource_line=""
 		  for resource in "${resources[@]}"; do
-			 echo
+			 if [ -n "$after_first_resource_line" ]; then
+				echo
+			 fi
+			 after_first_resource_line="true"
+			 
 			 echo "$resource"
 			 echo "===="
 			 ctx_dir=""
@@ -601,11 +615,11 @@ while read_tokens; do
 			 case "$resource" in
 				sync_session|s)
 				    ctx_dir="$wrk_dir/sync_session/"
-				    echo "Current sync session context: \"$sync_session_ctx\""
+				    current_ctx="$sync_session_ctx"
 				    ;;
 				user|u)
 				    ctx_dir="$wrk_dir/user/"
-				    echo "Current user context: \"$user_ctx\""
+				    current_ctx="$user_ctx"
 				    ;;
 				*)
 				    echo "Invalid resource \"$resource\""
@@ -613,17 +627,24 @@ while read_tokens; do
 				    ;;
 			 esac
 
-			 echo "ID  VALUE"
+			 echo "  ID  VALUE                                 NOTES"
 			 
 			 while read -r id; do
 				if [ -z "$id" ]; then
 				    continue
 				fi
-				echo "$id   $(cat $ctx_dir/$id)"
+				
+				if [[ "$current_ctx" == "$id" ]]; then
+				    current_marker="*"
+				else
+				    current_marker=" "
+				fi
+				
+				echo "$current_marker $id   $(cat $ctx_dir/$id/value)  $(cat $ctx_dir/$id/notes)"
 			 done <<<$(ls "$ctx_dir")
 		  done
 		  ;;
-	   set_context)
+	   use_context)
 		  resource="${tokens[1]}"
 		  id="${tokens[2]}"
 
@@ -754,7 +775,15 @@ while read_tokens; do
 		  else
 			 echo "$key=$value"
 		  fi
-		  ;;	 
+		  ;;
+	   clean)
+		  rm -rf "$wrk_dir"
+		  sync_session_ctx=""
+		  sync_session_id=""
+		  user_ctx=""
+		  user_id=""
+		  ensure_wrk_dir
+		  ;;
 	   '?') help ;;
 	   x)
 		  echo "Exiting"
