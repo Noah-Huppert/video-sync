@@ -42,6 +42,7 @@ Dependencies:
     - jq - https://stedolan.github.io/jq/
     - python3 - https://www.python.org/
     - GNU Date - https://www.gnu.org/software/coreutils/
+    - rlwrap - https://linux.die.net/man/1/rlwrap
 
 EOF
 }
@@ -50,32 +51,35 @@ function commands_help() {
     cat <<EOF
 Commands:
 
-    CTRL+D                      Close terminal
-    ?                           Show this help text
-    create <resource> <name>    Create resource. Only sync_session 
-                                resource supported
-    get <resource>              Get resource. Only sync_session resource supported
-    join <name>                 Join a sync session with a user named <name>
-    leave                       Leave a sync session
-    update <resource> <...>     Update a resource. Additional arguments may be
-                                required depending on the <resource>:
-                                sync_session.metadata:
-                                    <...> = <name>
-                                sync_session.playback:
-                                    <...> = <playing> <timestamp_seconds>
-                                user:
-                                    <...> = <name>
-                                user.role:
-                                    <...> = <user_id> <role>
-                                    Will authenticate with the current user context
-                                    <user_id> can be #<context id> to reference a
-                                    user in a different context
-    get_contexts <resource>     List the contexts available for a resource
-    set_context <resource> <id> Set the context for a resource
-    clear_contexts [<resource>] Remove all contexts for a resource, if none 
-                                specified defaults to clearing all resources
-    get_config <key>            Get a REPL configuration key
-    set_config <key> <value>    Set a REPL configuration key
+    x                                Close terminal
+    ?                                Show this help text
+    create <resource> <name>         Create resource. Only sync_session 
+                                     resource supported
+    get <resource>                   Get resource. Only sync_session 
+                                     resource supported
+    join <name>                      Join a sync session with a user named <name>
+    leave                            Leave a sync session
+    update <resource> <...>          Update a resource. Additional arguments may be
+                                     required depending on the <resource>:
+                                     sync_session.metadata:
+                                         <...> = <name>
+                                     sync_session.playback:
+                                         <...> = <playing> <timestamp_seconds>
+                                     user:
+                                         <...> = <name>
+                                     user.role:
+                                         <...> = <user_id> <role>
+                                         Will authenticate with the current user 
+                                         context <user_id> can be #<context id> to 
+                                         reference a user in a different context
+    redis <...>                      Runs <...> in the Redis CLI.
+    get_contexts <resource>          List the contexts available for a resource, 
+                                     if none specified defaults to all resources.
+    set_context <resource> <id>      Set the context for a resource
+    clear_contexts [<resource> <id>] Remove all contexts for a resource, if none 
+                                     specified defaults to clearing all resources
+    get_config <key>                 Get a REPL configuration key
+    set_config <key> <value>         Set a REPL configuration key
 EOF
 }
 
@@ -135,18 +139,66 @@ function add_context() { # ( resource, value ), STDOUT = context ID
 
     echo "$value" > "$wrk_dir/$resource/$next_id"
 
+    set_default_context "$resource" "$next_id"
+
     echo "$next_id"
 }
 
+function set_default_context() { # ( resource, ID )
+    resource="$1"
+    id="$2"
+    
+    echo "$id" > "$wrk_dir/default-id-$resource"
+}
+
+function get_default_context_id() { # ( resource ), STDOUT = context ID
+    # STDOUT empty if none
+    
+    resource="$1"
+
+    f="$wrk_dir/default-id-$resource"
+
+    if [ -f "$f" ]; then
+	   cat "$f"
+    fi
+}
+
+function get_context() { # ( resource, ID ), STDOUT = value
+    resource="$1"
+    id="$2"
+
+    cat "$wrk_dir/$resource/$id"
+}
+
+function get_config() { # ( key, default ), STDOUT = value
+    key="$1"
+    default="$2"
+
+    f="$wrk_dir/config/$key"
+
+    if [ -f "$f" ]; then
+	   cat "$f"
+    else
+	   echo "$default"
+    fi
+}
+
+function set_config() { # ( key, value ), STDOUT = value
+    key="$1"
+    value="$2"
+
+    echo "$value" > "$wrk_dir/config/$key"
+}
+
 function ensure_wrk_dir() { # ()
-    if ! mkdir -p "$wrk_dir"/{sync_session,user,trash}; then
+    if ! mkdir -p "$wrk_dir"/{sync_session,user,trash,config}; then
 	   die "Failed to creating working directories \"$wrk_dir\""
     fi
 }
 
 # Check for dependencies
 missing_bins=()
-for bin in http jq python3 date; do
+for bin in http jq python3 date rlwrap; do
     if ! which "$bin" &> /dev/null; then
 	   missing_bins+=("$bin")
     fi
@@ -162,18 +214,61 @@ wrk_dir="$prog_dir/.api-repl"
 ensure_wrk_dir
 
 # State
-api_url="localhost:8000"
+api_url=$(get_config "api_url" "localhost:8000")
+container_cli=$(get_config "container_cli" "sudo podman")
 
+sync_session_ctx=$(get_default_context_id sync_session)
 sync_session_id=""
+
+if [ -n "$sync_session_ctx" ]; then
+    sync_session_id=$(get_context sync_session "$sync_session_ctx")
+    echo "Current sync session context: \"$sync_session_ctx\""
+    echo "Sync session ID: \"$sync_session_id\""
+fi
+
+user_ctx=$(get_default_context_id user)
 user_id=""
 
-sync_session_ctx=""
-user_ctx=""
+if [ -n "$user_ctx" ]; then
+    user_id=$(get_context user "$user_ctx")
+    echo
+    echo "Current user context: \"$user_ctx\""
+    echo "User ID: \"$user_id\""
+    echo
+fi
 
 # Start prompt
 bold "Video Sync API REPL (Enter \"?\" for help)"
 
-while read -e -a tokens -p "> "; do
+function read_tokens() {
+    cmds=(x
+		?
+		create
+		get
+		join
+		leave
+		update
+		redis
+		get_contexts
+		set_context
+		clear_contexts
+		get_config
+		set_config)
+    tokens=$(rlwrap \
+			  -f <(echo "${cmds[@]}") \
+			  -P '> ' \
+			  -H "$prog_dir/.api-repl/history" \
+			  -o \
+			  cat)
+    if [[ "$?" != "0" ]]; then
+	   return 1
+    fi
+
+    tokens=($tokens)
+    tokens=(${tokens[@]:1})
+}
+
+while read_tokens; do
     command="${tokens[0]}"
     
     # Execute command
@@ -482,38 +577,51 @@ while read -e -a tokens -p "> "; do
 				;;
 		  esac
 		  ;;
+	   redis)
+		  set -x
+		  CONTAINER_CLI=$container_cli "$prog_dir/redis" cli "${tokens[@]:1}"
+		  set +x
+		  ;;
 	   get_contexts)
-		  resource="${tokens[1]}"
-		  if [ -z "$resource" ]; then
-			 echo "<resource> argument required"
-			 continue
+		  resource_arg="${tokens[1]}"
+		  resources=()
+
+		  if [ -n "$resource_arg" ]; then
+			 resources+=("$resource_arg")
+		  else
+			 resources+=("sync_session" "user")
 		  fi
 
-		  ctx_dir=""
+		  for resource in "${resources[@]}"; do
+			 echo
+			 echo "$resource"
+			 echo "===="
+			 ctx_dir=""
 
-		  case "$resource" in
-			 sync_session|s)
-				ctx_dir="$wrk_dir/sync_session/"
-				echo "Current sync session context: \"$sync_session_ctx\""
-				;;
-			 user|u)
-				ctx_dir="$wrk_dir/user/"
-				echo "Current user context: \"$user_ctx\""
-				;;
-			 *)
-				echo "Invalid resource \"$resource\""
-				continue
-				;;
-		  esac
+			 case "$resource" in
+				sync_session|s)
+				    ctx_dir="$wrk_dir/sync_session/"
+				    echo "Current sync session context: \"$sync_session_ctx\""
+				    ;;
+				user|u)
+				    ctx_dir="$wrk_dir/user/"
+				    echo "Current user context: \"$user_ctx\""
+				    ;;
+				*)
+				    echo "Invalid resource \"$resource\""
+				    continue
+				    ;;
+			 esac
 
-		  echo "ID  VALUE"
-		  
-		  while read -r id; do
-			 if [ -z "$id" ]; then
-				continue
-			 fi
-			 echo "$id  $(cat $ctx_dir/$id)"
-		  done <<<$(ls "$ctx_dir")
+			 echo "ID  VALUE"
+			 
+			 while read -r id; do
+				if [ -z "$id" ]; then
+				    continue
+				fi
+				echo "$id   $(cat $ctx_dir/$id)"
+			 done <<<$(ls "$ctx_dir")
+		  done
 		  ;;
 	   set_context)
 		  resource="${tokens[1]}"
@@ -548,12 +656,14 @@ while read -e -a tokens -p "> "; do
 			 sync_session|s)
 				sync_session_ctx="$id"
 				sync_session_id=$(cat "$ctx_file")
+				set_default_context "sync_session" "$id"
 				echo "Current sync session context: $sync_session_ctx"
 				echo "Sync session ID: $sync_session_id"
 				;;
 			 user|u)
 				user_ctx="$id"
 				user_id=$(cat "$ctx_file")
+				set_default_context "user" "$id"
 				echo "Current user context: $user_ctx"
 				echo "User ID: $user_id"
 				;;
@@ -565,31 +675,43 @@ while read -e -a tokens -p "> "; do
 		  ;;
 	   clear_contexts)
 		  resource="${tokens[1]}"
-		  
+		  id="${tokens[2]}"
+
+		  resources=()
+
+		  if [ -n "$resource" ]; then
+			 resources+=("$resource")
+		  fi
+
 		  ctx_dirs=()
 
-		  case "$resource" in
-			 sync_session|s) ctx_dirs+=("$wrk_dir/sync_session") ;;
-			 user|u) ctx_dirs+=("$wrk_dir/user") ;;
-			 '') ctx_dirs+=("$wrk_dir/sync_session" "$wrk_dir/user") ;;
-			 *)
-				echo "Invalid resource \"$resource\""
-				continue
-				;;
-		  esac
+		  for resource in "${resources[@]}"; do
+			 case "$resource" in
+				sync_session|s) ctx_dirs+=("$wrk_dir/sync_session") ;;
+				user|u) ctx_dirs+=("$wrk_dir/user") ;;
+				'') ctx_dirs+=("$wrk_dir/sync_session" "$wrk_dir/user") ;;
+				*)
+				    echo "Invalid resource \"$resource\""
+				    continue
+				    ;;
+			 esac
+		  done
 
-		  if ! mv "${ctx_dirs[@]}" "$wrk_dir/trash"; then
-			 echo "Failed to clear context(s)"
-			 continue
-		  fi
+		  for dir in "${ctx_dirs[@]}"; do
+			 to_delete="$dir"
+			 if [ -n "$id" ]; then
+				to_delete="$to_delete/$id"
+			 fi
+			 
+			 if ! mv "$to_delete" "$wrk_dir/trash"; then
+				echo "Failed to clear context(s)"
+				continue
+			 fi
+		  done
 
 		  ensure_wrk_dir
 
-		  if [ -z "$resource" ]; then
-			 echo "Cleared all contexts"
-		  else
-			 echo "Clearned $resource context"
-		  fi
+		  echo "Cleared contexts: ${resources[@]}"
 		  ;;
 	   set_config)
 		  key="${tokens[1]}"
@@ -602,12 +724,14 @@ while read -e -a tokens -p "> "; do
 
 		  case "$key" in
 			 api_url) api_url="$value" ;;
+			 container_cli) container_cli="$value" ;;
 			 *) failure="true" ;;
 		  esac
 
 		  if [ -n "$failure" ]; then
 			 echo "Invalid key \"$key\""
 		  else
+			 set_config "$key" "$value"
 			 echo "Set $key=$value"
 		  fi
 		  ;;
@@ -621,6 +745,7 @@ while read -e -a tokens -p "> "; do
 
 		  case "$key" in
 			 api_url) value="$api_url" ;;
+			 container_cli) value="$container_cli" ;;
 			 *) failure="true" ;;
 		  esac
 
@@ -631,6 +756,10 @@ while read -e -a tokens -p "> "; do
 		  fi
 		  ;;	 
 	   '?') help ;;
+	   x)
+		  echo "Exiting"
+		  exit 0
+		  ;;
 	   *)
 		  echo "Invalid command: \"$command\""
 		  commands_help
