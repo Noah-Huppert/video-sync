@@ -11,7 +11,7 @@ Receives state from client browser extensions and sends commands to
 synchronize them. 
 
 # Development
-![Complete start up of server as described below](./development.gif)  
+<img src="./development.gif" alt="Complete start up of server as described below" height="700px" >
 
 Rust is used for server programming. Podman is used to run a local Redis server.
 
