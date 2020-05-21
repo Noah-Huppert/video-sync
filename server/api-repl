@@ -724,7 +724,7 @@ while read_tokens; do
 		  ws_uri="ws://$api_url/api/v0/sync_session/$sync_session_id/changes"
 		  
 		  echo "WS $ws_uri"
-		  echo
+		  echo "(Press CTRL+C to exit WS)"
 		  
 		  if ! websocat "$ws_uri"; then
 			 echo "Failed to open sync session changes web socket"
