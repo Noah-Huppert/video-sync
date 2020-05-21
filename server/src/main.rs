@@ -2,6 +2,8 @@ use serde_json;
 use serde::{Serialize,Deserialize};
 use serde::de::DeserializeOwned;
 
+use actix::{Actor, StreamHandler};
+use actix_web_actors::ws;
 use actix_web::{web,http,HttpServer,App,Responder,HttpRequest,HttpResponse};
 use actix_web::dev::{ServiceResponse,ResponseBody};
 use actix_web::middleware::Logger;
@@ -1342,6 +1344,50 @@ async fn update_sync_session_user_role(
     })
 }
 
+/// Converts a connect to a web socket. This web socket will send a message to
+/// the client whenever a change occurs in the sync session.
+async fn changes_sync_session_web_socket(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+    req: HttpRequest,
+    stream: web::Payload,
+) -> impl Responder
+{
+    ws::start(SyncSessionChangesWS{
+        sync_session_id: urldata.into_inner(),
+        app_state: data,
+    }, &req, stream)
+}
+
+/// Web socket which notifies clients when a change occurs in a sync session.
+struct SyncSessionChangesWS {
+    /// ID of sync session for which to notify changes.
+    sync_session_id: String,
+
+    /// Redis connection.
+    app_state: web::Data<AppState>,
+}
+
+impl Actor for SyncSessionChangesWS {
+    type Context = ws::WebsocketContext<Self>;
+}
+
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>>
+    for SyncSessionChangesWS
+{
+    /// Handles web socket messages.
+    fn handle(
+        &mut self,
+        msg: Result<ws::Message, ws::ProtocolError>,
+        ctx: &mut Self::Context,
+    ) {
+        match msg {
+            Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
+            _ => (),
+        }
+    }
+}
+
 /// Default handler when no registered routes match a request.
 async fn not_found(_req: HttpRequest) -> impl Responder
 {
@@ -1498,7 +1544,6 @@ async fn main() -> std::io::Result<()> {
     });
 
     // TODO: Make subscribe web socket
-    // TODO: Make set privileged sync session metadata endpoint
 
     HttpServer::new(move || {
         App::new()
@@ -1524,6 +1569,8 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_user))
             .route("/api/v0/sync_session/{id}/user/role", web::put()
                    .to(update_sync_session_user_role))
+            .route("/api/v0/sync_session/{id}/chanes", web::get()
+                   .to(changes_sync_session_web_socket))
     })
         .bind("127.0.0.1:8000")?
         .run()

@@ -21,6 +21,7 @@ cmds=(x
 	 leave
 	 update
 	 redis
+	 ws
 	 get_contexts
 	 use_context
 	 clear_contexts
@@ -44,13 +45,18 @@ Resources:
     Some commands only support a subset of these resources. See command
     specific documentation for details.
 
-    sync_session|s                      Sync session
-    sync_session.playback|s.playback    Sync session playback information
-    sync_session.metadata|s.metadata    Sync session metadata
-    sync_session.privileged_metadata|   Privileged sync session metadata
-        s.privileged_metadata
-    user|u                              User
-    user.role|u.role                    User role
+    sync_session|s
+        Sync session
+    sync_session.playback|s.playback
+        Sync session playback information
+    sync_session.metadata|s.metadata
+        Sync session metadata
+    sync_session.privileged_metadata|s.privileged_metadata
+        Privileged sync session metadata
+    user|u
+        User
+    user.role|u.role
+        User role
 
 Dependencies:
 
@@ -61,6 +67,7 @@ Dependencies:
     - python3 - https://www.python.org/
     - GNU Date - https://www.gnu.org/software/coreutils/
     - rlwrap - https://linux.die.net/man/1/rlwrap
+    - websocat - https://github.com/vi/websocat
 
 EOF
 }
@@ -69,41 +76,49 @@ function commands_help() {
     cat <<EOF
 Commands:
 
-    x                                Close terminal
-    ? [<command>]                    Show this help text. Optionally shows only a
-                                     command's help
-    status                           Call API status endpoint.
-    create <resource> <name>         Create resource. Only sync_session 
-                                     resource supported
-    get <resource>                   Get resource. Only sync_session 
-                                     resource supported
-    join <name>                      Join a sync session with a user named <name>
-    leave                            Leave a sync session
-    update <resource> <...>          Update a resource. Additional arguments may be
-                                     required depending on the <resource>:
-                                     sync_session.metadata:
-                                         <...> = <name>
-                                     sync_session.privileged_metadata:
-                                         <...> = <privileged_playback>
-                                     sync_session.playback:
-                                         <...> = <playing> <timestamp_seconds>
-                                     user:
-                                         <...> = <name>
-                                     user.role:
-                                         <...> = <user_id> <role>
-                                         Will authenticate with the current user 
-                                         context <user_id> can be #<context id> to 
-                                         reference a user in a different context.
-                                         To remove a role from a user pass "none".
-    redis <...>                      Runs <...> in the Redis CLI.
-    get_contexts <resource>          List the contexts available for a resource, 
-                                     if none specified defaults to all resources.
-    use_context <resource> <id>      Set the context for a resource
-    clear_contexts [<resource> <id>] Remove all contexts for a resource, if none 
-                                     specified defaults to clearing all resources
-    get_config <key>                 Get a REPL configuration key
-    set_config <key> <value>         Set a REPL configuration key
-    clean                            Deletes all CLI config, context, and history
+    x
+        Close terminal
+    ? [<command>]
+        Show this help text. Optionally shows only a command's help
+    status
+        Call API status endpoint
+    create <resource> <name>
+        Create resource. Only sync_session resource supported
+    get <resource>
+        Get resource. Only sync_session resource supported
+    join <name>
+        Join a sync session with a user named <name>
+    leave
+        Leave a sync session
+    update <resource> <...>
+        Update a resource. Additional arguments may be required depending on the 
+        <resource>:
+            sync_session.metadate: <name>
+            sync_session.privileged_metadata: <privileged_playback>
+            sync_session.playback: <playing> <timestamp_seconds>
+            user: <name>
+            user.role: <user_id> <role>
+                Will authenticate with the current user context <user_id> can be 
+                #<context id> to reference a user in a different context. To 
+                remove a role from a user pass "none".
+    redis <...>
+        Runs <...> in the Redis CLI.
+    ws
+        Runs websocat on a sync session changes ws
+    get_contexts <resource>
+        List the contexts available for a resource, if none specified defaults to 
+        all resources.
+    use_context <resource> <id>
+        Set the context for a resource
+    clear_contexts [<resource> <id>]
+        Remove all contexts for a resource, if none specified defaults to clearing
+        all resources
+    get_config <key>
+        Get a REPL configuration key
+    set_config <key> <value>
+        Set a REPL configuration key
+    clean
+        Deletes all CLI config, context, and history
 EOF
 }
 
@@ -133,7 +148,7 @@ function filtered_commands_help() { # ( command )
 	   fi
 	   
 	   if [ -n "$do_print" ]; then
-		  echo "$line"
+		  echo "$line" | sed 's/^    //g'
 	   fi
     done <<<$(commands_help)
 }
@@ -316,7 +331,7 @@ function api_call() { # ( method, path, [options...] )
 
 # Check for dependencies
 missing_bins=()
-for bin in http jq python3 date rlwrap; do
+for bin in http jq python3 date rlwrap websocat; do
     if ! which "$bin" &> /dev/null; then
 	   missing_bins+=("$bin")
     fi
@@ -699,6 +714,17 @@ while read_tokens; do
 		  ;;
 	   redis)
 		  CONTAINER_CLI=$container_cli "$prog_dir/redis" cli "${tokens[@]:1}"
+		  ;;
+	   ws)
+		  if [ -z "$sync_session_id" ]; then
+			 echo "No sync session in context"
+			 continue
+		  fi
+
+		  if ! websocat "ws://$api_url/api/v0/sync_session/$sync_session_id/changes"; then
+			 echo "Failed to open sync session changes web socket"
+			 continue
+		  fi
 		  ;;
 	   get_contexts)
 		  resource_arg="${tokens[1]}"
