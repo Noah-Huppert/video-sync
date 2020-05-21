@@ -606,7 +606,7 @@ while read_tokens; do
 				    continue
 				fi
 
-				if ! api_call put "/api/v0/sync_session/$sync_session_id/playback" playing:="$playing" timestamp_seconds="$timestamp_seconds" timestamp_last_updated="$timestamp_last_updated"; then
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/playback" playing:="$playing" timestamp_seconds:="$timestamp_seconds" timestamp_last_updated:="$timestamp_last_updated"; then
 				    echo "Failed to update sync session playback"
 				    continue
 				fi
