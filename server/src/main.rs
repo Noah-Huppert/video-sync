@@ -303,7 +303,7 @@ struct SyncSession {
     name: String,
 
     /// Indicates if users must be privileged to set playback metadata.
-    set_playback_requires_privileges: bool,
+    privileged_playback: bool,
 
     /// If video is running.
     playing: bool,
@@ -345,7 +345,7 @@ impl SyncSession {
         SyncSession{
             id: id,
             name: String::new(),
-            set_playback_requires_privileges: false,
+            privileged_playback: false,
             playing: false,
             timestamp_seconds: 0,
             timestamp_last_updated: 0,
@@ -507,7 +507,7 @@ async fn create_sync_session(
     let sess = SyncSession{
         id: Uuid::new_v4().to_string(),
         name: req.name.clone(),
-        set_playback_requires_privileges: false,
+        privileged_playback: false,
         playing: false,
         timestamp_seconds: 0,
         timestamp_last_updated: now,
@@ -740,6 +740,91 @@ async fn update_sync_session_metadata(
     })
 }
 
+/// Update sync session privileged metadata request.
+#[derive(Deserialize)]
+struct UpdateSyncSessPrivilegedMetaReq {
+    /// New set playback required privileges field value.
+    privileged_playback: bool,
+}
+
+/// Update sync session privileged metadata response.
+#[derive(Serialize)]
+struct UpdateSyncSessPrivilegedMetaResp {
+    /// Updated sync session.
+    sync_session: SyncSession,
+}
+
+/// Updates a sync session's privileged metadata.
+async fn update_sync_session_privileged_metadata(
+    data: web::Data<AppState>,
+    urldata: web::Path<String>,
+    req: HttpRequest,
+    req_body: web::Json<UpdateSyncSessPrivilegedMetaReq>,
+) -> impl Responder
+{
+    let redis_conn = &mut data.redis_conn.lock().unwrap();
+    let sess_key = SyncSession::new_for_key(urldata.into_inner());
+
+    // Retrieve authorized user if provided
+    let authorized_user = match get_authorized_user(&req, redis_conn,
+                                                    sess_key.id.clone()).await
+    {
+        Err(e) => match e {
+            GetAuthUserError::ServerError(e) =>
+                return HttpResponse::InternalServerError().json(e),
+            GetAuthUserError::NotFound(e) =>
+                return HttpResponse::NotFound().json(e),
+        },
+        Ok(v) => match v {
+            Some(some_v) => some_v,
+            None => return HttpResponse::Unauthorized().json(
+                UserErrorResp::new("User not found")),
+        },
+    };
+
+    if !authorized_user.is_privileged() {
+        return HttpResponse::Unauthorized().json(
+            UserErrorResp::new("You do not have permissions to complete \
+                                this action"));
+    }
+
+    // Get sync session to update
+    let mut sess: SyncSession = match
+        load_from_redis(redis_conn, &sess_key).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Error finding sync session to update",
+                           &format!("Failed to get sync session: {}", e))),
+        Ok(v) => match v {
+            None => return HttpResponse::NotFound().json(
+                UserErrorResp::new(&format!("Sync session {} not found",
+                                            sess_key.id))),
+            Some(v) => v,
+        },
+    };
+
+
+    // Update
+    sess.privileged_playback = req_body.privileged_playback;
+    sess.last_updated = Utc::now().timestamp();
+
+    let mut redis_pipeline = redis::pipe();
+    redis_pipeline.atomic();
+
+    match RedisStoreMany::new(&mut redis_pipeline)
+        .store(&sess, &sess).expire(&sess, REDIS_KEY_TTL)
+        .execute(redis_conn).await
+    {
+        Err(e) => return HttpResponse::InternalServerError().json(
+            ServerErrorResp::new("Failed to update sync session", &e)),
+        _ => (),
+    }
+
+    HttpResponse::Ok().json(UpdateSyncSessPrivilegedMetaResp{
+        sync_session: sess,
+    })
+}
+
 /// Update sync session status request. See SyncSession field documentation for
 /// more information on request fields.
 #[derive(Deserialize)]
@@ -762,7 +847,7 @@ struct UpdateSyncSessionStatusResp {
 
 /// Updates a sync session's playback status. Triggers sending an update message
 /// on the play status web socket. Authorization may be required if the sync
-/// session's set_playback_requires_privileges field is true.
+/// session's privileged_playback field is true.
 async fn update_sync_session_playback(
     data: web::Data<AppState>,
     urldata: web::Path<String>,
@@ -789,7 +874,7 @@ async fn update_sync_session_playback(
     };
 
     // Authenticate user if required
-    if sess.set_playback_requires_privileges {
+    if sess.privileged_playback {
         match get_authorized_user(&req, redis_conn, sess.id.clone()).await {
             Err(e) => match e {
                 GetAuthUserError::ServerError(e) =>
@@ -1413,7 +1498,6 @@ async fn main() -> std::io::Result<()> {
     });
 
     // TODO: Make subscribe web socket
-    // TODO: Add privileged sync session metadata field which indicates who can set the play status, any user or privileged users
     // TODO: Make set privileged sync session metadata endpoint
 
     HttpServer::new(move || {
@@ -1428,6 +1512,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v0/sync_session/{id}", web::get().to(get_sync_session))
             .route("/api/v0/sync_session/{id}/metadata", web::put()
                    .to(update_sync_session_metadata))
+            .route("/api/v0/sync_session/{id}/metadata/privileged", web::put()
+                   .to(update_sync_session_privileged_metadata))
             .route("/api/v0/sync_session/{id}/playback", web::put()
                    .to(update_sync_session_playback))
             .route("/api/v0/sync_session/{id}/user", web::post()
