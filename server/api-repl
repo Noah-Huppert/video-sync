@@ -12,6 +12,22 @@ function die() {
     exit 1
 }
 
+cmds=(x
+	 ?
+	 status
+	 create
+	 get
+	 join
+	 leave
+	 update
+	 redis
+	 get_contexts
+	 use_context
+	 clear_contexts
+	 get_config
+	 set_config
+	 clean)
+
 function help() {
     cat <<EOF
 Video Sync API REPL.
@@ -31,6 +47,8 @@ Resources:
     sync_session|s                      Sync session
     sync_session.playback|s.playback    Sync session playback information
     sync_session.metadata|s.metadata    Sync session metadata
+    sync_session.privileged_metadata|   Privileged sync session metadata
+        s.privileged_metadata
     user|u                              User
     user.role|u.role                    User role
 
@@ -52,7 +70,9 @@ function commands_help() {
 Commands:
 
     x                                Close terminal
-    ?                                Show this help text
+    ? [<command>]                    Show this help text. Optionally shows only a
+                                     command's help
+    status                           Call API status endpoint.
     create <resource> <name>         Create resource. Only sync_session 
                                      resource supported
     get <resource>                   Get resource. Only sync_session 
@@ -63,6 +83,8 @@ Commands:
                                      required depending on the <resource>:
                                      sync_session.metadata:
                                          <...> = <name>
+                                     sync_session.privileged_metadata:
+                                         <...> = <privileged_playback>
                                      sync_session.playback:
                                          <...> = <playing> <timestamp_seconds>
                                      user:
@@ -85,10 +107,43 @@ Commands:
 EOF
 }
 
-function get_arg() { # ( line, index ), index starts at 1
-    line="$1"
-    index="\$$2"
-    echo "$line" | awk "{ printf $index }"
+function filtered_commands_help() { # ( command )
+    command="$1"
+
+    do_print=""
+
+    while IFS='' read line; do
+	   first_token=$(echo "$line" | awk '{ print $1 }')
+	   first_token_is_cmd=""
+
+	   for cmd in "${cmds[@]}"; do
+		  if [[ "$first_token" == "$cmd" ]]; then
+			 first_token_is_cmd="true"
+			 break
+		  fi
+	   done
+
+	   
+	   if [ -n "$first_token_is_cmd" ]; then
+		  if [[ $(echo "$line" | awk '{ print $1 }') == "$command" ]]; then
+			 do_print="true"
+		  else
+			 do_print=""
+		  fi
+	   fi
+	   
+	   if [ -n "$do_print" ]; then
+		  echo "$line"
+	   fi
+    done <<<$(commands_help)
+}
+
+function is_boolean() { # ( value ), returns 0 if bool
+    value="$1"
+    
+    if [[ "$value" != "true" ]] && [[ "$value" != "false" ]]; then
+	   return 1
+    fi
 }
 
 function extract_from_resp() { # ( resp, extract ), extract=header|json
@@ -130,6 +185,7 @@ function canonicalize_resource() { # ( resource ), STDOUT = canonicalized resour
 	   sync_session|s) echo "sync_session" ;;
 	   sync_session.playback|s.playback) echo "sync_session.playback" ;;
 	   sync_session.metadata|s.metadata) echo "sync_session.metadata" ;;
+	   sync_session.privileged_metadata|s.privileged_metadata) echo "sync_session.privileged_metadata" ;;
 	   user|u) echo "user" ;;
 	   user.role|u.role) echo "user.role" ;;
     esac
@@ -305,21 +361,6 @@ fi
 bold "Video Sync API REPL (Enter \"?\" for help)"
 
 function read_tokens() {
-    cmds=(x
-		?
-		create
-		get
-		join
-		leave
-		update
-		redis
-		get_contexts
-		use_context
-		clear_contexts
-		get_config
-		set_config
-		clean)
-
     if [[ "$last_command_status" == "not run" ]]; then
 	   prompt="✨> "
     elif [ -n "$last_command_status" ]; then
@@ -350,6 +391,15 @@ while read_tokens; do
     
     # Execute command
     case "$command" in
+	   status)
+		  if ! api_call get "/api/v0/status"; then
+			 echo "Failed to get API status"
+			 continue
+		  fi
+
+		  echo "API status:"
+		  echo "$body" | pretty_json
+		  ;;
 	   create)
 		  resource=$(canonicalize_resource "${tokens[1]}")
 		  name="${tokens[2]}"
@@ -500,6 +550,32 @@ while read_tokens; do
 				echo "Response:"
 				echo "$body" | pretty_json
 				;;
+			 sync_session.privileged_metadata)
+				privileged_playback="${tokens[2]}"
+				if [ -z "$privileged_playback" ]; then
+				    echo "<privileged_playback> argument required"
+				    continue
+				fi
+
+				if ! is_boolean "$privileged_playback"; then
+				    echo "<privileged_playback> argument must be \"true\" or \"false\""
+				    continue
+				fi
+
+				if [ -z "$sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/metadata/privileged" privileged_playback:="$privileged_playback"; then
+				    echo "Failed to set sync session privileged metadata"
+				    continue
+				fi
+
+				echo "Set sync session privileged metadata"
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
 			 sync_session.playback)
 				playing="${tokens[2]}"
 				timestamp_seconds="${tokens[3]}"
@@ -509,13 +585,10 @@ while read_tokens; do
 				    continue
 				fi
 
-				case "$playing" in
-				    true|false) ;;
-				    *)
-					   echo "<playing> must be either \"true\" or \"false\""
-					   continue
-					   ;;
-				esac
+				if ! is_boolean "$playing"; then
+				    echo "<playing> must be either \"true\" or \"false\""
+				    continue
+				fi
 
 				if [ -z "$timestamp_seconds" ]; then
 				    echo "<timestamp_seconds> argument required"
@@ -632,7 +705,7 @@ while read_tokens; do
 		  resources=()
 
 		  if [ -n "$resource_arg" ]; then
-			 resources+=("$resource_arg")
+			 resources+=("$(canonicalize_resource $resource_arg)")
 		  else
 			 resources+=("sync_session" "user")
 		  fi
@@ -826,7 +899,15 @@ while read_tokens; do
 		  user_id=""
 		  ensure_wrk_dir
 		  ;;
-	   '?') help ;;
+	   '?')
+		  command="${tokens[1]}"
+
+		  if [ -z "$command" ]; then
+			 help
+		  else
+			 filtered_commands_help "$command"
+		  fi
+		  ;;
 	   x)
 		  echo "Exiting"
 		  exit 0
@@ -838,5 +919,6 @@ while read_tokens; do
 		  ;;
     esac
 
+    echo
     last_command_status="true"
 done
