@@ -71,7 +71,8 @@ Commands:
                                          <...> = <user_id> <role>
                                          Will authenticate with the current user 
                                          context <user_id> can be #<context id> to 
-                                         reference a user in a different context
+                                         reference a user in a different context.
+                                         To remove a role from a user pass "none".
     redis <...>                      Runs <...> in the Redis CLI.
     get_contexts <resource>          List the contexts available for a resource, 
                                      if none specified defaults to all resources.
@@ -122,6 +123,16 @@ function remove_quotes() { # (), STDIN = input
 
 function pretty_json() { # (), STDIN = input
     cat | python3 -m json.tool
+}
+
+function canonicalize_resource() { # ( resource ), STDOUT = canonicalized resource
+    case "$1" in
+	   sync_session|s) echo "sync_session" ;;
+	   sync_session.playback|s.playback) echo "sync_session.playback" ;;
+	   sync_session.metadata|s.metadata) echo "sync_session.metadata" ;;
+	   user|u) echo "user" ;;
+	   user.role|u.role) echo "user.role" ;;
+    esac
 }
 
 function add_context() { # ( resource, value ), STDOUT = context ID
@@ -220,13 +231,19 @@ function api_call() { # ( method, path, [options...] )
     shift
     path="$1"
     shift
+    
     options="$@"
 
     echo "HTTP $(echo $method | tr '[[:lower:]]' '[[:upper:]]') $api_url$path"
     echo "Authorization: $user_id"
     echo "$options"
-    
-    resp=$(http -p bh "$method" "$api_url$path" "Authorization: $user_id" $options)
+    echo
+
+    if [ -n "$user_id" ]; then
+	   resp=$(http -p bh "$method" "$api_url$path" "Authorization: $user_id" $options)
+    else
+	   resp=$(http -p bh "$method" "$api_url$path" $options)
+    fi
     header=$(extract_from_resp "$resp" header)
     body=$(extract_from_resp "$resp" json)
     
@@ -268,7 +285,8 @@ sync_session_id=""
 if [ -n "$sync_session_ctx" ]; then
     sync_session_id=$(get_context sync_session "$sync_session_ctx" value)
     echo "Current sync session context: \"$sync_session_ctx\""
-    echo "Sync session ID: \"$sync_session_id\""
+    echo "Sync session context notes  : $(get_context sync_session $sync_session_ctx notes)"
+    echo "Sync session ID             : \"$sync_session_id\""
 fi
 
 user_ctx=$(get_default_context_id user)
@@ -278,7 +296,8 @@ if [ -n "$user_ctx" ]; then
     user_id=$(get_context user "$user_ctx" value)
     echo
     echo "Current user context: \"$user_ctx\""
-    echo "User ID: \"$user_id\""
+    echo "User context notes  : $(get_context user $user_ctx notes)"
+    echo "User ID             : \"$user_id\""
     echo
 fi
 
@@ -301,10 +320,18 @@ function read_tokens() {
 		set_config
 		clean)
 
+    if [[ "$last_command_status" == "not run" ]]; then
+	   prompt="✨> "
+    elif [ -n "$last_command_status" ]; then
+	   prompt="✅> "
+    else
+	   prompt="❌> "
+    fi
+
     tokens=$(rlwrap \
 			  -f <(echo "${cmds[@]}") \
 			  -H "$prog_dir/.api-repl/history" \
-			  -S '> ' \
+			  -S "$prompt" \
 			  -o \
 			  cat)
     if [[ "$?" != "0" ]]; then
@@ -314,13 +341,17 @@ function read_tokens() {
     tokens=($tokens)
 }
 
+last_command_status="not run"
+
 while read_tokens; do
     command="${tokens[0]}"
+
+    last_command_status=""
     
     # Execute command
     case "$command" in
 	   create)
-		  resource="${tokens[1]}"
+		  resource=$(canonicalize_resource "${tokens[1]}")
 		  name="${tokens[2]}"
 
 		  if [ -z "$resource" ]; then
@@ -334,7 +365,7 @@ while read_tokens; do
 		  fi
 		  
 		  case "$resource" in
-			 sync_session|s)
+			 sync_session)
 				if ! api_call post "/api/v0/sync_session" name="$name"; then
 				    echo "Failed to create sync session"
 				    continue
@@ -345,6 +376,7 @@ while read_tokens; do
 
 				sync_session_ctx=$(add_context "sync_session" "$sync_session_id")
 				user_ctx=$(add_context "user" "$user_id")
+				set_context user "$user_ctx" notes "Owner of sync_session/$sync_session_ctx"
 
 				echo "Created sync session:"
 				echo "    Sync Session ID: $sync_session_id"
@@ -360,14 +392,14 @@ while read_tokens; do
 		  esac
 		  ;;
 	   get)
-		  resource="${tokens[1]}"
+		  resource=$(canonicalize_resource "${tokens[1]}")
 		  if [ -z "$resource" ]; then
 			 echo "<resource> argument required"
 			 continue
 		  fi
 
 		  case "$resource" in
-			 sync_session|s)
+			 sync_session)
 				if [ -z "$sync_session_id" ]; then
 				    echo "No sync session in context"
 				    continue
@@ -406,7 +438,7 @@ while read_tokens; do
 		  
 		  user_id=$(echo "$body" | jq .user_id | remove_quotes)
 		  user_ctx=$(add_context user "$user_id")
-		  set_context user "$user_ctx" notes "Joined"
+		  set_context user "$user_ctx" notes "Joined sync_session/$sync_session_ctx"
 
 		  echo "Join sync session:"
 		  echo "    User ID: $user_id"
@@ -425,7 +457,7 @@ while read_tokens; do
 			 continue
 		  fi
 
-		  if ! api_call delete "/api/v0/sync_session/$sync_session_id/user" user="$user_id"; then
+		  if ! api_call delete "/api/v0/sync_session/$sync_session_id/user" user_id="$user_id"; then
 			 echo "Failed to leave sync session"
 			 continue
 		  fi
@@ -437,17 +469,17 @@ while read_tokens; do
 
 		  echo "Left sync session"
 		  echo "Response:"
-		  echo "$resp"
+		  echo "$body" | pretty_json
 		  ;;
 	   update)
-		  resource="${tokens[1]}"
+		  resource=$(canonicalize_resource "${tokens[1]}")
 		  if [ -z "$resource" ]; then
 			 echo "<resource> argument required"
 			 continue
 		  fi
 
 		  case "$resource" in
-			 sync_session.metadata|s.metadata)
+			 sync_session.metadata)
 				name="${tokens[2]}"
 				if [ -z "$name" ]; then
 				    echo "<name> argument is required"
@@ -466,9 +498,9 @@ while read_tokens; do
 
 				echo "Set sync session metadata"
 				echo "Response:"
-				echo "$resp"
+				echo "$body" | pretty_json
 				;;
-			 sync_session.playback|s.playback)
+			 sync_session.playback)
 				playing="${tokens[2]}"
 				timestamp_seconds="${tokens[3]}"
 
@@ -508,9 +540,9 @@ while read_tokens; do
 
 				echo "Update sync session playback"
 				echo "Response:"
-				echo "$resp"
+				echo "$body" | pretty_json
 				;;
-			 user|u)
+			 user)
 				name="${tokens[2]}"
 				if [ -z "$name" ]; then
 				    echo "<name> argument required"
@@ -534,13 +566,13 @@ while read_tokens; do
 
 				echo "Updated user"
 				echo "Response:"
-				echo "$resp"
+				echo "$body" | pretty_json
 				;;
-			 user.role|u.role)
-				user_id="${tokens[2]}"
+			 user.role)
+				target_user_id="${tokens[2]}"
 				role="${tokens[3]}"
 				
-				if [ -z "$user_id" ]; then
+				if [ -z "$target_user_id" ]; then
 				    echo "<user_id> argument required"
 				    continue
 				fi
@@ -548,6 +580,10 @@ while read_tokens; do
 				if [ -z "$role" ]; then
 				    echo "<role> argument is required"
 				    continue
+				fi
+
+				if [[ "$role" == "none" ]]; then
+				    role=""
 				fi
 
 				if [ -z "$sync_session_id" ]; then
@@ -560,26 +596,26 @@ while read_tokens; do
 				    continue
 				fi
 
-				if [[ $(echo "$user_id" | cut -c1-1) == "#" ]]; then
-				    ctx_id=$(echo "$user_id" | cut -c2-)
-				    ctx_file="$wrk_dir/user/$ctx_id"
+				if [[ $(echo "$target_user_id" | cut -c1-1) == "#" ]]; then
+				    target_user_ctx_id=$(echo "$target_user_id" | cut -c2-)
+				    target_user_ctx_dir="$wrk_dir/user/$target_user_ctx_id"
 
-				    if [ ! -f "$ctx_file" ]; then
-					   echo "Context user/$ctx_id does not exist"
+				    if [ ! -d "$target_user_ctx_dir" ]; then
+					   echo "Context user/$target_user_ctx_id does not exist"
 					   continue
 				    fi
 
-				    user_id=$(cat "$ctx_file")
+				    target_user_id=$(get_context user "$target_user_ctx_id" value)
 				fi
 
-				if ! api_call put "/api/v0/sync_session/$sync_session_id/user/role" user_id="$user_id" role="$role"; then
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/user/role" user_id="$target_user_id" role="$role"; then
 				    echo "Failed to set user role"
 				    continue
 				fi
 
 				echo "Set user role"
 				echo "Response:"
-				echo "$resp"
+				echo "$body" | pretty_json
 				;;
 			 *)
 				echo "Invalid resource \"$resource\""
@@ -613,11 +649,11 @@ while read_tokens; do
 			 ctx_dir=""
 
 			 case "$resource" in
-				sync_session|s)
+				sync_session)
 				    ctx_dir="$wrk_dir/sync_session/"
 				    current_ctx="$sync_session_ctx"
 				    ;;
-				user|u)
+				user)
 				    ctx_dir="$wrk_dir/user/"
 				    current_ctx="$user_ctx"
 				    ;;
@@ -645,48 +681,54 @@ while read_tokens; do
 		  done
 		  ;;
 	   use_context)
-		  resource="${tokens[1]}"
+		  resource=$(canonicalize_resource "${tokens[1]}")
 		  id="${tokens[2]}"
 
 		  if [ -z "$resource" ]; then
-			 echo "resource argument required"
+			 echo "<resource> argument required"
 			 continue
 		  fi
 
 		  if [ -z "$id" ]; then
-			 echo "id argument required"
+			 echo "<id> argument required"
 			 continue
 		  fi
 
-		  ctx_file=""
+		  ctx_dir=""
 		  case "$resource" in
-			 sync_session|s) ctx_file="$wrk_dir/sync_session/$id" ;;
-			 user|u) ctx_file="$wrk_dir/user/$id" ;;
+			 sync_session) ctx_dir="$wrk_dir/sync_session/$id" ;;
+			 user) ctx_dir="$wrk_dir/user/$id" ;;
 			 *)
 				echo "Invalid resource \"$resource\""
 				continue
 				;;
 		  esac
 
-		  if [ ! -f "$ctx_file" ]; then
+		  if [ ! -d "$ctx_dir" ]; then
 			 echo "Context $resource/$id does not exist"
 			 continue
 		  fi
 
 		  case "$resource" in
-			 sync_session|s)
+			 sync_session)
 				sync_session_ctx="$id"
-				sync_session_id=$(cat "$ctx_file")
+				sync_session_id=$(get_context sync_session "$id" value)
+				
 				set_default_context "sync_session" "$id"
+				
 				echo "Current sync session context: $sync_session_ctx"
-				echo "Sync session ID: $sync_session_id"
+				echo "Sync session context notes  : $(get_context sync_session $sync_session_ctx notes)"
+				echo "Sync session ID             : $sync_session_id"
 				;;
-			 user|u)
+			 user)
 				user_ctx="$id"
-				user_id=$(cat "$ctx_file")
+				user_id=$(get_context user "$id" value)
+				
 				set_default_context "user" "$id"
+				
 				echo "Current user context: $user_ctx"
-				echo "User ID: $user_id"
+				echo "User context notes  : $(get_context user $user_ctx notes)"
+				echo "User ID             : $user_id"
 				;;
 			 *)
 				echo "Invalid resource \"$resource\""
@@ -695,7 +737,7 @@ while read_tokens; do
 		  esac
 		  ;;
 	   clear_contexts)
-		  resource="${tokens[1]}"
+		  resource=$(canonicalize_resource "${tokens[1]}")
 		  id="${tokens[2]}"
 
 		  resources=()
@@ -708,8 +750,8 @@ while read_tokens; do
 
 		  for resource in "${resources[@]}"; do
 			 case "$resource" in
-				sync_session|s) ctx_dirs+=("$wrk_dir/sync_session") ;;
-				user|u) ctx_dirs+=("$wrk_dir/user") ;;
+				sync_session) ctx_dirs+=("$wrk_dir/sync_session") ;;
+				user) ctx_dirs+=("$wrk_dir/user") ;;
 				'') ctx_dirs+=("$wrk_dir/sync_session" "$wrk_dir/user") ;;
 				*)
 				    echo "Invalid resource \"$resource\""
@@ -732,7 +774,7 @@ while read_tokens; do
 
 		  ensure_wrk_dir
 
-		  echo "Cleared contexts: ${resources[@]}"
+		  echo "Cleared contexts: ${resources[@]}/$id"
 		  ;;
 	   set_config)
 		  key="${tokens[1]}"
@@ -792,6 +834,9 @@ while read_tokens; do
 	   *)
 		  echo "Invalid command: \"$command\""
 		  commands_help
+		  continue
 		  ;;
     esac
+
+    last_command_status="true"
 done
