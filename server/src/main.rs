@@ -1158,10 +1158,12 @@ async fn update_sync_session_user_role(
     }
 
     // Ensure request body role value is valid
-    if &req_body.role != USER_ROLE_OWNER && &req_body.role != USER_ROLE_ADMIN {
+    if &req_body.role != USER_ROLE_OWNER && &req_body.role != USER_ROLE_ADMIN &&
+        &req_body.role != ""
+    {
         return HttpResponse::BadRequest().json(
-            UserErrorResp::new(&format!("role field must be either \"{}\" \
-                                         or \"{}\"", USER_ROLE_OWNER,
+            UserErrorResp::new(&format!("role field must be either \"{}\", \
+                                         \"{}\", \"\"", USER_ROLE_OWNER,
                                         USER_ROLE_ADMIN)));
     }
 
