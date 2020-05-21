@@ -347,7 +347,7 @@ wrk_dir="$prog_dir/.api-repl"
 ensure_wrk_dir
 
 # State
-api_url=$(get_config "api_url" "localhost:8000")
+api_url=$(get_config "api_url" "127.0.0.1:8000")
 container_cli=$(get_config "container_cli" "sudo podman")
 
 sync_session_ctx=$(get_default_context_id sync_session)
@@ -721,7 +721,12 @@ while read_tokens; do
 			 continue
 		  fi
 
-		  if ! websocat "ws://$api_url/api/v0/sync_session/$sync_session_id/changes"; then
+		  ws_uri="ws://$api_url/api/v0/sync_session/$sync_session_id/changes"
+		  
+		  echo "WS $ws_uri"
+		  echo
+		  
+		  if ! websocat "$ws_uri"; then
 			 echo "Failed to open sync session changes web socket"
 			 continue
 		  fi

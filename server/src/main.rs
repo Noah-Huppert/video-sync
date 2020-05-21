@@ -1383,6 +1383,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>>
     ) {
         match msg {
             Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
+            Ok(ws::Message::Text(text)) => ctx.text(format!("you said: {}", text)),
             _ => (),
         }
     }
@@ -1569,7 +1570,7 @@ async fn main() -> std::io::Result<()> {
                    .to(update_sync_session_user))
             .route("/api/v0/sync_session/{id}/user/role", web::put()
                    .to(update_sync_session_user_role))
-            .route("/api/v0/sync_session/{id}/chanes", web::get()
+            .route("/api/v0/sync_session/{id}/changes", web::get()
                    .to(changes_sync_session_web_socket))
     })
         .bind("127.0.0.1:8000")?
