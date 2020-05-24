@@ -10,7 +10,7 @@ use actix_web::middleware::Logger;
 use actix_web::middleware::errhandlers::{ErrorHandlerResponse,ErrorHandlers};
 
 use redis::{RedisResult,AsyncCommands,FromRedisValue};
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionLike,MultiplexedConnection};
 
 #[macro_use] extern crate log;
 use env_logger::Env;
@@ -18,11 +18,237 @@ use uuid::Uuid;
 use chrono::Utc;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex,RwLock};
 use std::marker::Sized;
+use std::ops::Drop;
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::convert::From;
+use std::fmt::Debug;
 
 /// Number of seconds sync session and user keys last in Redis. Set to 1 day.
 const REDIS_KEY_TTL: usize = 86400;
+
+/// Initial Redis connection pool max connections value.
+const REDIS_POOL_START_MAX_CONNS: u64 = 100;
+
+/// Redis asynchronous connection pool.
+///
+/// ## Behavior
+///
+/// - get() creates a new Redis connection or uses an idle one if available
+/// - get() asynchronously blocks if the maximum number of connections has
+///   been reached
+/// - get() returns a RedisConnectionLease which uses the Drop trait to return
+///   connections to an idle connection pool when they go out of scope
+/// - The idle connection pool holds at most twice the number of leased connections
+/// - If there are 10 callers of get() waiting for a connection because the number
+///   of maximum connections has been reached the pool will query Redis to see if it
+///   can afford to increase the maximum number of connections
+struct RedisConnectionPool<T: ConnectionLike> {
+    /// Redis client which is used to open new connections.
+    redis_client: redis::Client,
+
+    /// Connection used for pool administration.
+    admin_conn: T,
+
+    /// Maximum number of allowed active connections. If this limit is frequently
+    /// reached the pool will query Redis to see if there is spare space for
+    /// more connections. If so the max_conns value will be raised.
+    max_conns: u64,
+
+    /// Number of connections which are currently leased.
+    leased_conns: RwLock<u64>,
+
+    /// Number of callers which are waiting for a connection because the maximum
+    /// number of connections has been reached.
+    blocked_callers: RwLock<u64>,
+
+    /// List of idle clients. 
+    idle_conns: RwLock<Vec<T>>,
+}
+
+impl <T: ConnectionLike> RedisConnectionPool<T> {
+    /// Initializes a connection pool.
+    async fn new(redis_uri: &str) -> Result<RedisConnectionPool<T>, String> {
+        // Create client
+        let redis_client = match redis::Client::open(redis_uri) {
+            Err(e) => return Err(format!("Failed to open redis connection: {}", e)),
+            Ok(v) => v,
+        };
+
+        // Create administration connection
+        let admin_conn = match RedisConnectionPool::build_connection(
+            redis_client).await
+        {
+            Err(e) => return Err(format!("Failed to build administration \
+                                          connection: {}", e)),
+            Ok(v) => v,
+        };
+
+        Ok(RedisConnectionPool{
+            redis_client: redis_client,
+            admin_conn: admin_conn,
+            max_conns: REDIS_POOL_START_MAX_CONNS,
+            leased_conns: RwLock::new(0),
+            blocked_callers: RwLock::new(0),
+            idle_conns: RwLock::new(Vec::new()),
+        })
+    }
+
+    /// Used internally to create new asynchronous Redis connections. Pings Redis
+    /// with the new connection before returning to make sure the connection
+    /// is working.
+    async fn build_connection(redis_client: redis::Client) -> Result<T, String> {
+        // Create
+        let (mut redis_conn, redis_driver) = match
+            redis_client.get_multiplexed_async_connection().await
+        {
+            Err(e) => return Err(format!("Failed to get redis connection: {}", e)),
+            Ok(v) => v,
+            
+        };
+
+        actix_rt::spawn(redis_driver);
+
+        // Test
+        let ping_res: RedisResult<String> = redis::cmd("PING")
+            .query_async(&mut redis_conn).await;
+        if ping_res != Ok("PONG".to_string()) {
+            return Err(format!("Redis ping connection test failed: {:?}",
+                               ping_res));
+        }
+
+        Ok(&mut redis_conn)
+    }
+
+    /// Builds a new RedisConnectionLease.
+    fn build_conn_lease(&mut self, conn: T) -> RedisConnectionLease<T> {
+        RedisConnectionLease::new(self.idle_conns, self.leased_conns, conn)
+    }
+
+    /// Retrieve a connection for use. If there are idle connections available one
+    /// of these is returned. If no idle connections are available and the pool is
+    /// under the maximum connections limit a new connection is created. If no idle
+    /// connections are available but the pool is at the maximum connection limit
+    /// the method blocks asynchronously until a new connection is available.
+    ///
+    /// The connection is returned to the pool when the return value goes out
+    /// of scope. See RedisConnectionLease for the implementation of this behavior.
+    async fn get<'a>(
+        &mut self
+    ) -> Result<RedisConnectionLease<T>, RedisPoolError<'a>>
+    {
+        // Check if there are any spare idle connections
+        {
+            if self.idle_conns.read()?.len() > 0 {
+                let mut leased_conns = self.leased_conns.write()?;
+                *leased_conns += 1;
+                return self.build_conn_lease(self.idle_conns.write()?.pop().unwrap());
+            }
+        }
+
+        // If no avaliable idle connections check if we can build a new one
+        if self.leased_conns.read()? < self.max_conns {
+            let conn = match RedisConnectionLease::build_connection(
+                self.redis_client)
+            {
+                Err(e) => return RedisPoolError::new(&format!(
+                    "Failed to build new Redis connection: {}", e)),
+                Ok(v) => v,
+            };
+
+            let mut leased_conns = self.leased_conns.write()?;
+            *leased_conns += 1;
+            return self.build_conn_lease(conn);
+        }
+
+        // If out of idle connections and we can't build a new one, wait until
+        // a connection becomes available
+    }
+}
+
+/// Error for redis connection pool.
+struct RedisPoolError<'a> {
+    e: &'a str,
+}
+
+impl <'a> RedisPoolError<'a> {
+    /// Creates a new RedisPoolError from a string.
+    fn new(e: &str) -> RedisPoolError<'a> {
+        RedisPoolError{
+            e: e,
+        }
+    }
+}
+
+impl
+    <'a, T: Debug>
+    From<std::sync::PoisonError<std::sync::RwLockReadGuard<'a, T>>>
+    for
+    RedisPoolError<'a>
+{
+    /// Converts a Mutex lock error into a RedisPoolError.
+    fn from(
+        e: std::sync::PoisonError<std::sync::MutexGuard<'a, T>>
+    ) -> Self {
+        RedisPoolError{
+            e: &format!("Failed to lock: {:?}", e),
+        }
+    }
+}
+
+/// Leases a Redis connection from a RedisConnectionPool. When the value goes out
+/// of scope the underlying connection is returned to the pool. If the idle
+/// connections pool is more than twice the number of leased connections the
+/// underlying connection is closed and permanently dropped.
+struct RedisConnectionLease<T: ConnectionLike> {
+    /// List of idle connections from connection pool to which the connection will
+    /// be returned.
+    pool_idle_conns: RwLock<Rc<RefCell<Vec<T>>>>,
+
+    /// Count of leased connections, de-incremented when the leased connection
+    /// is returned.
+    pool_leased_conns: RwLock<Rc<RefCell<u64>>>,
+
+    /// Underlying connection.
+    conn: T,
+}
+
+impl <T: ConnectionLike> RedisConnectionPool<T> {
+    /// Creates a new connection lease.
+    fn new(
+        pool_idle_conns: RwLock<Rc<RefCell<Vec<T>>>>,
+        pool_leased_conns: RwLock<Rc<RefCell<u64>>>,
+        conn: T,
+    ) -> RedisConnectionPool<T>
+    {
+        RedisConnectionPool{
+            pool_idle_conns: pool_idle_conns,
+            pool_leased_conns: pool_leased_conns,
+            conn: conn,
+        }
+    }
+}
+
+impl <T: ConnectionLike> Drop for RedisConnectionPool<T> {
+    /// Returns the undlying connection to the connection pool. If a failure
+    /// occurs while dropping the connection it panics.
+    fn drop(&mut self) {
+        // Record as returned from lease
+        self.pool_leased_conns.write().unwrap().borrow_mut() -= 1;
+        
+        // Store in idle pool if maximum number of idle connections has not
+        // been reached
+        if self.pool_idle_conns.read().unwrap().borrow().len() <
+            self.pool_leased_conns.read().unwrap().borrow() * 2
+        {
+            self.pool_idle_conns.write().borrow_mut().push(self.conn);
+        }
+
+        // Otherwise let self.conn fall out of scope and be closed
+    }
+}
 
 /// HTTP app state.
 struct AppState {
