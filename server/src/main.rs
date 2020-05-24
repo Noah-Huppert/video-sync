@@ -21,10 +21,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex,RwLock,RwLockReadGuard,RwLockWriteGuard,PoisonError};
 use std::marker::Sized;
 use std::ops::Drop;
-use std::rc::Rc;
-use std::cell::RefCell;
 use std::convert::From;
+use std::fmt;
 use std::fmt::Debug;
+use std::clone::Clone;
+use std::rc::Rc;
 
 /// Number of seconds sync session and user keys last in Redis. Set to 1 day.
 const REDIS_KEY_TTL: usize = 86400;
@@ -42,10 +43,10 @@ const REDIS_POOL_START_MAX_CONNS: u64 = 100;
 /// - get() returns a RedisConnectionLease which uses the Drop trait to return
 ///   connections to an idle connection pool when they go out of scope
 /// - The idle connection pool holds at most twice the number of leased connections
-/// - If there are 10 callers of get() waiting for a connection because the number
+/// - TODO: If there are 10 callers of get() waiting for a connection because the number
 ///   of maximum connections has been reached the pool will query Redis to see if it
 ///   can afford to increase the maximum number of connections
-#[derive(Copy)]
+#[derive(Clone)]
 struct RedisConnectionPool {
     /// Redis client which is used to open new connections.
     redis_client: redis::Client,
@@ -59,14 +60,19 @@ struct RedisConnectionPool {
     max_conns: u64,
 
     /// Number of connections which are currently leased.
-    leased_conns: RwLock<u64>,
+    leased_conns: Rc<RwLock<u64>>,
 
     /// Number of callers which are waiting for a connection because the maximum
     /// number of connections has been reached.
-    blocked_callers: RwLock<u64>,
+    blocked_callers: Rc<RwLock<u64>>,
 
     /// List of idle clients. 
-    idle_conns: RwLock<Vec<MultiplexedConnection>>,
+    idle_conns: Rc<RwLock<Vec<MultiplexedConnection>>>,
+
+    /// Stores an error which might occur while returning a connection to the
+    /// pool. If this is not None then the pool is considered poisoned and cannot
+    /// lease any new connections.
+    end_lease_err: Rc<RwLock<Option<RedisPoolError>>>,
 }
 
 impl RedisConnectionPool {
@@ -91,9 +97,10 @@ impl RedisConnectionPool {
             redis_client: redis_client,
             admin_conn: admin_conn,
             max_conns: REDIS_POOL_START_MAX_CONNS,
-            leased_conns: RwLock::new(0),
-            blocked_callers: RwLock::new(0),
-            idle_conns: RwLock::new(Vec::new()),
+            leased_conns: Rc::new(RwLock::new(0)),
+            blocked_callers: Rc::new(RwLock::new(0)),
+            idle_conns: Rc::new(RwLock::new(Vec::new())),
+            end_lease_err: Rc::new(RwLock::new(None)),
         })
     }
 
@@ -127,12 +134,12 @@ impl RedisConnectionPool {
     }
 
     /// Builds a new RedisConnectionLease.
-    fn build_conn_lease(
-        &mut self,
-        conn: MultiplexedConnection
-    ) -> RedisConnectionLease
+    fn build_conn_lease<'a>(
+        &'a self,
+        conn: &'a MultiplexedConnection
+    ) -> RedisConnectionLease<'a>
     {
-        RedisConnectionLease::new(*self, conn)
+        RedisConnectionLease::new(self, conn)
     }
 
     /// Retrieve a connection for use. If there are idle connections available one
@@ -144,16 +151,23 @@ impl RedisConnectionPool {
     /// The connection is returned to the pool when the return value goes out
     /// of scope. See RedisConnectionLease for the implementation of this behavior.
     async fn get<'a>(
-        &'a mut self
-    ) -> Result<RedisConnectionLease, RedisPoolError<'a>>
+        &'a self,
+    ) -> Result<RedisConnectionLease<'a>, RedisPoolError>
     {
+        // Check if pool is poisoned, if so exit early
+        match &*self.end_lease_err.read()? {
+            Some(e) => return Err(RedisPoolError::new(&format!(
+                "Connection pool is poisoned: {}", &e))),
+            None => (),
+        };
+        
         // Check if there are any spare idle connections
         match self.idle_conns.write()?.pop() {
             Some(conn) => {
                 let mut leased_conns = self.leased_conns.write()?;
                 *leased_conns += 1;
 
-                return Ok(self.build_conn_lease(conn))
+                return Ok(self.build_conn_lease(&conn))
             },
             None => (),
         };
@@ -168,7 +182,7 @@ impl RedisConnectionPool {
 
             let mut leased_conns = self.leased_conns.write()?;
             *leased_conns += 1;
-            return Ok(self.build_conn_lease(conn));
+            return Ok(self.build_conn_lease(&conn));
         }
 
         // If out of idle connections and we can't build a new one, wait until
@@ -177,135 +191,171 @@ impl RedisConnectionPool {
         Err(RedisPoolError::new("Ran out of connections and haven't implemented \
                                  connection waiting yet"))
     }
-}
 
-/// Error for redis connection pool.
-struct RedisPoolError<'a> {
-    e: &'a str,
-}
-
-impl <'a> RedisPoolError<'a> {
-    /// Creates a new RedisPoolError from a string.
-    fn new(e: &'a str) -> RedisPoolError<'a> {
-        RedisPoolError{
-            e: e,
-        }
-    }
-}
-
-impl <'a> From<PoisonError<RwLockReadGuard<'a, u64>>> for RedisPoolError<'a> {
-    /// Converts a Mutex lock error into a RedisPoolError.
-    fn from(e: PoisonError<RwLockReadGuard<'a, u64>>) -> Self {
-        RedisPoolError{
-            e: &format!("Failed to lock: {}", e),
-        }
-    }
-}
-
-impl <'a> From<PoisonError<RwLockWriteGuard<'a, u64>>> for RedisPoolError<'a> {
-    /// Converts a Mutex lock error into a RedisPoolError.
-    fn from(e: PoisonError<RwLockWriteGuard<'a, u64>>) -> Self {
-        RedisPoolError{
-            e: &format!("Failed to lock: {}", e),
-        }
-    }
-}
-
-impl
-    <'a> From<PoisonError<RwLockReadGuard<'a, Vec<MultiplexedConnection>>>>
-    for RedisPoolError<'a>
-{
-    /// Converts a Mutex lock error into a RedisPoolError.
-    fn from(
-        e: PoisonError<RwLockReadGuard<'a, Vec<MultiplexedConnection>>>
-    ) -> Self
+    /// Returns a leased connection to the pool. Not called directly, but instead
+    /// called by end_lease.
+    fn try_end_lease<'a>(
+        &'a self,
+        conn: &'a MultiplexedConnection
+    ) -> Result<(), RedisPoolError>
     {
-        RedisPoolError{
-            e: &format!("Failed to lock: {}", e),
-        }
-    }
-}
-
-impl
-    <'a> From<PoisonError<RwLockWriteGuard<'a, Vec<MultiplexedConnection>>>>
-    for RedisPoolError<'a>
-{
-    /// Converts a Mutex lock error into a RedisPoolError.
-    fn from(
-        e: PoisonError<RwLockWriteGuard<'a, Vec<MultiplexedConnection>>>
-    ) -> Self
-    {
-        RedisPoolError{
-            e: &format!("Failed to lock: {}", e),
-        }
-    }
-}
-
-/// Leases a Redis connection from a RedisConnectionPool. The release() method
-/// should be called when connection is no longer needed. This method should
-/// only be called once. If this method is not called the Drop trait will panic!,
-/// causing the program to abort. This not graceful way of failing was choosen
-/// because not calling release() breaks a contract with the behavior of
-/// RedisConnectionPool and can cause its internal state to corrupt.
-///
-/// If the idle connections pool is more than twice the number of leased
-/// connections the underlying connection is closed and permanently dropped.
-struct RedisConnectionLease {
-    /// Connection pool from which underlying connection was leased.
-    pool: RedisConnectionPool,
-    
-    /// Underlying connection.
-    conn: MultiplexedConnection,
-
-    /// Indicates if release() was called.
-    released: bool,
-}
-
-impl RedisConnectionLease {
-    /// Creates a new connection lease.
-    fn new(
-        pool: RedisConnectionPool,
-        conn: MultiplexedConnection,
-    ) -> RedisConnectionLease
-    {
-        RedisConnectionLease{
-            pool: pool,
-            conn: conn,
-            released: false,
-        }
-    }
-
-    /// Returns the underlying connection to the connection pool. Must be called
-    /// exactly once.
-    fn release(&mut self) -> Result<(), RedisPoolError> {
-        if self.released {
-            return Err(RedisPoolError::new("release() already called"));
-        }
-        
         // Record as returned from lease
-        let mut leased_conns = self.pool.leased_conns.write()?;
+        let mut leased_conns = self.leased_conns.write()?;
         *leased_conns -= 1;
         
         // Store in idle pool if maximum number of idle connections has not
         // been reached
-        if (self.pool.idle_conns.read()?.len() as u64) <
-            (*self.pool.leased_conns.read()? * 2)
-        {
-            self.pool.idle_conns.write()?.push(self.conn);
+        let idle_conns_r = self.idle_conns.read()?;
+        let leased_conns_r = self.leased_conns.read()?;
+        
+        if (idle_conns_r.len() as u64) < (*leased_conns_r * 2) {
+            self.idle_conns.write()?.push(*conn);
         }
-
+        
         // Otherwise let self.conn fall out of scope and be closed
         Ok(())
     }
+    
+    /// Returns a leased connection to the pool. Records errors internally since
+    /// this method is called by RedisConnectionLease::drop() which cannot fail.
+    /// If this method fails the connection pool is considered poisoned and cannot
+    /// lease out any new connections. Due to the fact that failing corrupts the
+    /// internal state of the pool.
+    fn end_lease<'a>(&'a self, conn: &'a MultiplexedConnection) {
+        match self.try_end_lease(conn) {
+            Err(e) => {
+                error!("Error while ending lease: {}", &e);
+
+                let mut end_lease_err = match self.end_lease_err.write() {
+                    Err(ee) => {
+                        panic!("Error while ending lease, but then an error \
+                                occurred while trying to record this error: {}",
+                               ee);
+                    },
+                    Ok(v) => v,
+                };
+                *end_lease_err = Some(e);
+            },
+            _ => (),
+        };
+    }
 }
 
-impl Drop for RedisConnectionLease {
-    /// Checks that release() was called. Panics if it was not, since calling
-    /// release() is essential to maintaining the state of RedisConnectionPool.
-    fn drop(&mut self) {
-        if !self.released {
-            panic!("RedisConnectionLease.release() was not called exactly once");
+/// Error for redis connection pool.
+#[derive(Clone)]
+struct RedisPoolError {
+    e: String,
+}
+
+impl RedisPoolError {
+    /// Creates a new RedisPoolError from a string.
+    fn new(e: &str) -> RedisPoolError {
+        RedisPoolError{
+            e: String::from(e),
         }
+    }
+}
+
+impl
+    From<PoisonError<RwLockReadGuard<'_, Option<RedisPoolError>>>>
+    for
+    RedisPoolError
+{
+    /// Converts a Mutex lock error into a RedisPoolError.
+    fn from(
+        e: PoisonError<RwLockReadGuard<'_, Option<RedisPoolError>>>
+    ) -> Self
+    {
+        RedisPoolError{
+            e: format!("Failed to lock: {}", e),
+        }
+    }
+}
+
+impl From<PoisonError<RwLockReadGuard<'_, u64>>> for RedisPoolError {
+    /// Converts a Mutex lock error into a RedisPoolError.
+    fn from(e: PoisonError<RwLockReadGuard<'_, u64>>) -> Self {
+        RedisPoolError{
+            e: format!("Failed to lock: {}", e),
+        }
+    }
+}
+
+impl From<PoisonError<RwLockWriteGuard<'_, u64>>> for RedisPoolError {
+    /// Converts a Mutex lock error into a RedisPoolError.
+    fn from(e: PoisonError<RwLockWriteGuard<'_, u64>>) -> Self {
+        RedisPoolError{
+            e: format!("Failed to lock: {}", e),
+        }
+    }
+}
+
+impl
+    From<PoisonError<RwLockReadGuard<'_, Vec<MultiplexedConnection>>>>
+    for RedisPoolError
+{
+    /// Converts a Mutex lock error into a RedisPoolError.
+    fn from(
+        e: PoisonError<RwLockReadGuard<'_, Vec<MultiplexedConnection>>>
+    ) -> Self
+    {
+        RedisPoolError{
+            e: format!("Failed to lock: {}", e),
+        }
+    }
+}
+
+impl
+    From<PoisonError<RwLockWriteGuard<'_, Vec<MultiplexedConnection>>>>
+    for RedisPoolError
+{
+    /// Converts a Mutex lock error into a RedisPoolError.
+    fn from(
+        e: PoisonError<RwLockWriteGuard<'_, Vec<MultiplexedConnection>>>
+    ) -> Self
+    {
+        RedisPoolError{
+            e: format!("Failed to lock: {}", e),
+        }
+    }
+}
+
+impl fmt::Display for RedisPoolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.e)
+    }
+}
+
+/// Leases a Redis connection from a RedisConnectionPool. Once it goes out of
+/// scope the connection is returned to the pool. If an error occurs while
+/// returning it is stored in the connection pool, since the Drop trait
+/// cannot fail.
+struct RedisConnectionLease<'a> {
+    /// Connection pool from which underlying connection was leased.
+    pool: &'a RedisConnectionPool,
+    
+    /// Underlying connection.
+    conn: &'a MultiplexedConnection,
+}
+
+impl <'a> RedisConnectionLease<'a> {
+    /// Creates a new connection lease.
+    fn new(
+        pool: &'a RedisConnectionPool,
+        conn: &'a MultiplexedConnection,
+    ) -> RedisConnectionLease<'a>
+    {
+        RedisConnectionLease{
+            pool: pool,
+            conn: conn,
+        }
+    }
+}
+
+impl <'a> Drop for RedisConnectionLease<'a> {
+    /// Returns the underyling connection to the connection pool.
+    fn drop(&mut self) {
+        self.pool.end_lease(self.conn);
     }
 }
 
