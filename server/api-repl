@@ -1,0 +1,955 @@
+#!/usr/bin/env bash
+
+# Helpers
+prog_dir=$(realpath $(dirname "$0"))
+
+function bold() {
+    echo "$(tput bold)$@$(tput sgr0)"
+}
+
+function die() {
+    echo "Error: $@" >&2
+    exit 1
+}
+
+cmds=(x
+	 ?
+	 status
+	 create
+	 get
+	 join
+	 leave
+	 update
+	 redis
+	 ws
+	 get_contexts
+	 use_context
+	 clear_contexts
+	 get_config
+	 set_config
+	 clean)
+
+function help() {
+    cat <<EOF
+Video Sync API REPL.
+
+Calls the video sync API and stores state to create an interactive terminal 
+interface for testing the API.
+
+Enter one command per line.
+
+$(commands_help)
+
+Resources:
+
+    Some commands only support a subset of these resources. See command
+    specific documentation for details.
+
+    sync_session|s
+        Sync session
+    sync_session.playback|s.playback
+        Sync session playback information
+    sync_session.metadata|s.metadata
+        Sync session metadata
+    sync_session.privileged_metadata|s.privileged_metadata
+        Privileged sync session metadata
+    user|u
+        User
+    user.role|u.role
+        User role
+
+Dependencies:
+
+    The following software must be installed:
+
+    - HTTPie - https://httpie.org/
+    - jq - https://stedolan.github.io/jq/
+    - python3 - https://www.python.org/
+    - GNU Date - https://www.gnu.org/software/coreutils/
+    - rlwrap - https://linux.die.net/man/1/rlwrap
+    - websocat - https://github.com/vi/websocat
+
+EOF
+}
+
+function commands_help() {
+    cat <<EOF
+Commands:
+
+    x
+        Close terminal
+    ? [<command>]
+        Show this help text. Optionally shows only a command's help
+    status
+        Call API status endpoint
+    create <resource> <name>
+        Create resource. Only sync_session resource supported
+    get <resource>
+        Get resource. Only sync_session resource supported
+    join <name>
+        Join a sync session with a user named <name>
+    leave
+        Leave a sync session
+    update <resource> <...>
+        Update a resource. Additional arguments may be required depending on the 
+        <resource>:
+            sync_session.metadate: <name>
+            sync_session.privileged_metadata: <privileged_playback>
+            sync_session.playback: <playing> <timestamp_seconds>
+            user: <name>
+            user.role: <user_id> <role>
+                Will authenticate with the current user context <user_id> can be 
+                #<context id> to reference a user in a different context. To 
+                remove a role from a user pass "none".
+    redis <...>
+        Runs <...> in the Redis CLI.
+    ws
+        Runs websocat on a sync session changes ws
+    get_contexts <resource>
+        List the contexts available for a resource, if none specified defaults to 
+        all resources.
+    use_context <resource> <id>
+        Set the context for a resource
+    clear_contexts [<resource> <id>]
+        Remove all contexts for a resource, if none specified defaults to clearing
+        all resources
+    get_config <key>
+        Get a REPL configuration key
+    set_config <key> <value>
+        Set a REPL configuration key
+    clean
+        Deletes all CLI config, context, and history
+EOF
+}
+
+function filtered_commands_help() { # ( command )
+    command="$1"
+
+    do_print=""
+
+    while IFS='' read line; do
+	   first_token=$(echo "$line" | awk '{ print $1 }')
+	   first_token_is_cmd=""
+
+	   for cmd in "${cmds[@]}"; do
+		  if [[ "$first_token" == "$cmd" ]]; then
+			 first_token_is_cmd="true"
+			 break
+		  fi
+	   done
+
+	   
+	   if [ -n "$first_token_is_cmd" ]; then
+		  if [[ $(echo "$line" | awk '{ print $1 }') == "$command" ]]; then
+			 do_print="true"
+		  else
+			 do_print=""
+		  fi
+	   fi
+	   
+	   if [ -n "$do_print" ]; then
+		  echo "$line" | sed 's/^    //g'
+	   fi
+    done <<<$(commands_help)
+}
+
+function is_boolean() { # ( value ), returns 0 if bool
+    value="$1"
+    
+    if [[ "$value" != "true" ]] && [[ "$value" != "false" ]]; then
+	   return 1
+    fi
+}
+
+function extract_from_resp() { # ( resp, extract ), extract=header|json
+    resp="$1"
+    extract="$2"
+    
+    header_done=""
+
+    while read -r line; do
+	   if echo "$line" | grep "{" &> /dev/null; then
+		  header_done="true"
+	   fi
+
+	   case "$extract" in
+		  header)
+			 if [ -z "$header_done" ]; then
+				echo "$line"
+			 fi
+			 ;;
+		  json)
+			 if [ -n "$header_done" ]; then
+				echo "$line"
+			 fi
+			 ;;
+	   esac
+    done <<<$(echo "$resp")
+}
+
+function remove_quotes() { # (), STDIN = input
+    cat | sed 's/"//g'
+}
+
+function pretty_json() { # (), STDIN = input
+    cat | python3 -m json.tool
+}
+
+function canonicalize_resource() { # ( resource ), STDOUT = canonicalized resource
+    case "$1" in
+	   sync_session|s) echo "sync_session" ;;
+	   sync_session.playback|s.playback) echo "sync_session.playback" ;;
+	   sync_session.metadata|s.metadata) echo "sync_session.metadata" ;;
+	   sync_session.privileged_metadata|s.privileged_metadata) echo "sync_session.privileged_metadata" ;;
+	   user|u) echo "user" ;;
+	   user.role|u.role) echo "user.role" ;;
+    esac
+}
+
+function add_context() { # ( resource, value ), STDOUT = context ID
+    resource="$1"
+    value="$2"
+
+    # Get next ID for context
+    next_id=0
+    while read -r id; do
+	   if [ -z "$id" ]; then
+		  continue
+	   fi
+	   
+	   if (($id >= $next_id)); then
+		  next_id=$(($id + 1))
+	   fi
+    done <<<$(ls "$wrk_dir/$resource")
+
+    # Make directory
+    dir="$wrk_dir/$resource/$next_id"
+    mkdir -p "$dir"
+    
+    echo "$value" > "$dir/value"
+    touch "$dir/notes"
+
+    set_default_context "$resource" "$next_id"
+
+    echo "$next_id"
+}
+
+function set_default_context() { # ( resource, ID )
+    resource="$1"
+    id="$2"
+    
+    echo "$id" > "$wrk_dir/default-id-$resource"
+}
+
+function get_default_context_id() { # ( resource ), STDOUT = context ID
+    # STDOUT empty if none
+    
+    resource="$1"
+
+    f="$wrk_dir/default-id-$resource"
+
+    if [ -f "$f" ]; then
+	   cat "$f"
+    fi
+}
+
+function get_context() { # ( resource, ID, part ), STDOUT = value
+    resource="$1"
+    id="$2"
+    part="$3"
+
+    cat "$wrk_dir/$resource/$id/$part"
+}
+
+function set_context() { # ( resource, ID, part, value )
+    resource="$1"
+    id="$2"
+    part="$3"
+    value="$4"
+
+    echo "$value" > "$wrk_dir/$resource/$id/$part"
+}
+
+function get_config() { # ( key, default ), STDOUT = value
+    key="$1"
+    default="$2"
+
+    f="$wrk_dir/config/$key"
+
+    if [ -f "$f" ]; then
+	   cat "$f"
+    else
+	   echo "$default"
+    fi
+}
+
+function set_config() { # ( key, value ), STDOUT = value
+    key="$1"
+    value="$2"
+
+    echo "$value" > "$wrk_dir/config/$key"
+}
+
+function ensure_wrk_dir() { # ()
+    if ! mkdir -p "$wrk_dir"/{sync_session,user,trash,config}; then
+	   die "Failed to creating working directories \"$wrk_dir\""
+    fi
+}
+
+function api_call() { # ( method, path, [options...] )
+    # Sets the header and body variables to the result
+    method="$1"
+    shift
+    path="$1"
+    shift
+    
+    options="$@"
+
+    echo "HTTP $(echo $method | tr '[[:lower:]]' '[[:upper:]]') $api_url$path"
+    echo "Authorization: $user_id"
+    echo "$options"
+    echo
+
+    if [ -n "$user_id" ]; then
+	   resp=$(http -p bh "$method" "$api_url$path" "Authorization: $user_id" $options)
+    else
+	   resp=$(http -p bh "$method" "$api_url$path" $options)
+    fi
+    header=$(extract_from_resp "$resp" header)
+    body=$(extract_from_resp "$resp" json)
+    
+    if [[ "$?" != "0" ]]; then
+	   echo "$method $path failed"
+	   echo "$resp"
+	   return 1
+    elif [[ $(echo "$header" | head -n 1 | cut -d ' ' -f 2) != "200" ]]; then
+	   echo "$method $path failed"
+	   echo "$resp"
+	   return 1
+    fi
+}
+
+# Check for dependencies
+missing_bins=()
+for bin in http jq python3 date rlwrap websocat; do
+    if ! which "$bin" &> /dev/null; then
+	   missing_bins+=("$bin")
+    fi
+done
+
+if [ -n "$missing_bins" ]; then
+    die "Missing dependencies: ${missing_bins[@]}"
+fi
+
+# Create working directory
+wrk_dir="$prog_dir/.api-repl"
+
+ensure_wrk_dir
+
+# State
+api_url=$(get_config "api_url" "127.0.0.1:8000")
+container_cli=$(get_config "container_cli" "sudo podman")
+
+sync_session_ctx=$(get_default_context_id sync_session)
+sync_session_id=""
+
+if [ -n "$sync_session_ctx" ]; then
+    sync_session_id=$(get_context sync_session "$sync_session_ctx" value)
+    echo "Current sync session context: \"$sync_session_ctx\""
+    echo "Sync session context notes  : $(get_context sync_session $sync_session_ctx notes)"
+    echo "Sync session ID             : \"$sync_session_id\""
+fi
+
+user_ctx=$(get_default_context_id user)
+user_id=""
+
+if [ -n "$user_ctx" ]; then
+    user_id=$(get_context user "$user_ctx" value)
+    echo
+    echo "Current user context: \"$user_ctx\""
+    echo "User context notes  : $(get_context user $user_ctx notes)"
+    echo "User ID             : \"$user_id\""
+    echo
+fi
+
+# Start prompt
+bold "Video Sync API REPL (Enter \"?\" for help)"
+
+function read_tokens() {
+    if [[ "$last_command_status" == "not run" ]]; then
+	   prompt="✨> "
+    elif [ -n "$last_command_status" ]; then
+	   prompt="✅> "
+    else
+	   prompt="❌> "
+    fi
+
+    tokens=$(rlwrap \
+			  -f <(echo "${cmds[@]}") \
+			  -H "$prog_dir/.api-repl/history" \
+			  -S "$prompt" \
+			  -o \
+			  cat)
+    if [[ "$?" != "0" ]]; then
+	   return 1
+    fi
+
+    tokens=($tokens)
+}
+
+last_command_status="not run"
+
+while read_tokens; do
+    command="${tokens[0]}"
+
+    last_command_status=""
+    
+    # Execute command
+    case "$command" in
+	   status)
+		  if ! api_call get "/api/v0/status"; then
+			 echo "Failed to get API status"
+			 continue
+		  fi
+
+		  echo "API status:"
+		  echo "$body" | pretty_json
+		  ;;
+	   create)
+		  resource=$(canonicalize_resource "${tokens[1]}")
+		  name="${tokens[2]}"
+
+		  if [ -z "$resource" ]; then
+			 echo "<resource> argument required"
+			 continue
+		  fi
+
+		  if [ -z "$name" ]; then
+			 echo "<name> argument required"
+			 continue
+		  fi
+		  
+		  case "$resource" in
+			 sync_session)
+				if ! api_call post "/api/v0/sync_session" name="$name"; then
+				    echo "Failed to create sync session"
+				    continue
+				fi
+				
+				sync_session_id=$(echo "$body" | jq .sync_session.id | remove_quotes)
+				user_id=$(echo "$body" | jq .user_id | remove_quotes)
+
+				sync_session_ctx=$(add_context "sync_session" "$sync_session_id")
+				user_ctx=$(add_context "user" "$user_id")
+				set_context user "$user_ctx" notes "Owner of sync_session/$sync_session_ctx"
+
+				echo "Created sync session:"
+				echo "    Sync Session ID: $sync_session_id"
+				echo "    User Id        : $user_id"
+				echo
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
+			 *)
+				echo "Invalid resource \"$resource\""
+				echo "Command only supports the sync_session resource"
+				;;
+		  esac
+		  ;;
+	   get)
+		  resource=$(canonicalize_resource "${tokens[1]}")
+		  if [ -z "$resource" ]; then
+			 echo "<resource> argument required"
+			 continue
+		  fi
+
+		  case "$resource" in
+			 sync_session)
+				if [ -z "$sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				if ! api_call get "/api/v0/sync_session/$sync_session_id"; then
+				    echo "Failed to get sync session"
+				    continue
+				fi
+
+				echo "Sync session:"
+				echo "$body" | pretty_json
+				;;
+			 *)
+				echo "Invalid resource \"$resource\""
+				echo "Command only supports the sync_session resource"
+				;;
+		  esac
+		  ;;
+	   join)
+		  name="${tokens[1]}"
+		  if [ -z "$name" ]; then
+			 echo "<name> argument required"
+			 continue
+		  fi
+
+		  if [ -z "$sync_session_id" ]; then
+			 echo "No sync session in context"
+			 continue
+		  fi
+
+		  if ! api_call post "/api/v0/sync_session/$sync_session_id/user" name="$name";then 
+			 echo "Failed to join sync session"
+			 continue
+		  fi
+		  
+		  user_id=$(echo "$body" | jq .user_id | remove_quotes)
+		  user_ctx=$(add_context user "$user_id")
+		  set_context user "$user_ctx" notes "Joined sync_session/$sync_session_ctx"
+
+		  echo "Join sync session:"
+		  echo "    User ID: $user_id"
+		  echo
+		  echo "Response:"
+		  echo "$body" | pretty_json
+		  ;;
+	   leave)
+		  if [ -z "$sync_session_id" ]; then
+			 echo "No sync session in context"
+			 continue
+		  fi
+
+		  if [ -z "$user_id" ]; then
+			 echo "No user in context"
+			 continue
+		  fi
+
+		  if ! api_call delete "/api/v0/sync_session/$sync_session_id/user" user_id="$user_id"; then
+			 echo "Failed to leave sync session"
+			 continue
+		  fi
+
+		  set_context user "$user_ctx" notes "Left"
+
+		  user_id=""
+		  user_ctx=""
+
+		  echo "Left sync session"
+		  echo "Response:"
+		  echo "$body" | pretty_json
+		  ;;
+	   update)
+		  resource=$(canonicalize_resource "${tokens[1]}")
+		  if [ -z "$resource" ]; then
+			 echo "<resource> argument required"
+			 continue
+		  fi
+
+		  case "$resource" in
+			 sync_session.metadata)
+				name="${tokens[2]}"
+				if [ -z "$name" ]; then
+				    echo "<name> argument is required"
+				    continue
+				fi
+
+				if [ -z "$sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/metadata" name="$name"; then
+				    echo "Failed to set sync session metadata"
+				    continue
+				fi
+
+				echo "Set sync session metadata"
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
+			 sync_session.privileged_metadata)
+				privileged_playback="${tokens[2]}"
+				if [ -z "$privileged_playback" ]; then
+				    echo "<privileged_playback> argument required"
+				    continue
+				fi
+
+				if ! is_boolean "$privileged_playback"; then
+				    echo "<privileged_playback> argument must be \"true\" or \"false\""
+				    continue
+				fi
+
+				if [ -z "$sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/metadata/privileged" privileged_playback:="$privileged_playback"; then
+				    echo "Failed to set sync session privileged metadata"
+				    continue
+				fi
+
+				echo "Set sync session privileged metadata"
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
+			 sync_session.playback)
+				playing="${tokens[2]}"
+				timestamp_seconds="${tokens[3]}"
+
+				if [ -z "$playing" ]; then
+				    echo "<playing> argument required"
+				    continue
+				fi
+
+				if ! is_boolean "$playing"; then
+				    echo "<playing> must be either \"true\" or \"false\""
+				    continue
+				fi
+
+				if [ -z "$timestamp_seconds" ]; then
+				    echo "<timestamp_seconds> argument required"
+				    continue
+				fi
+
+				if [ -z "sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				timestamp_last_updated=$(date "+%s")
+				if [[ "$?" != "0" ]]; then
+				    echo "Failed to get current time for timestamp_last_updated"
+				    continue
+				fi
+
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/playback" playing:="$playing" timestamp_seconds:="$timestamp_seconds" timestamp_last_updated:="$timestamp_last_updated"; then
+				    echo "Failed to update sync session playback"
+				    continue
+				fi
+
+				echo "Update sync session playback"
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
+			 user)
+				name="${tokens[2]}"
+				if [ -z "$name" ]; then
+				    echo "<name> argument required"
+				    continue
+				fi
+
+				if [ -z "$sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				if [ -z "$user_id" ]; then
+				    echo "No user in context"
+				    continue
+				fi
+
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/user" user_id="$user_id" name="$name"; then
+				    echo "Failed to update user"
+				    continue
+				fi
+
+				echo "Updated user"
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
+			 user.role)
+				target_user_id="${tokens[2]}"
+				role="${tokens[3]}"
+				
+				if [ -z "$target_user_id" ]; then
+				    echo "<user_id> argument required"
+				    continue
+				fi
+
+				if [ -z "$role" ]; then
+				    echo "<role> argument is required"
+				    continue
+				fi
+
+				if [[ "$role" == "none" ]]; then
+				    role=""
+				fi
+
+				if [ -z "$sync_session_id" ]; then
+				    echo "No sync session in context"
+				    continue
+				fi
+
+				if [ -z "$user_id" ]; then
+				    echo "No user in context"
+				    continue
+				fi
+
+				if [[ $(echo "$target_user_id" | cut -c1-1) == "#" ]]; then
+				    target_user_ctx_id=$(echo "$target_user_id" | cut -c2-)
+				    target_user_ctx_dir="$wrk_dir/user/$target_user_ctx_id"
+
+				    if [ ! -d "$target_user_ctx_dir" ]; then
+					   echo "Context user/$target_user_ctx_id does not exist"
+					   continue
+				    fi
+
+				    target_user_id=$(get_context user "$target_user_ctx_id" value)
+				fi
+
+				if ! api_call put "/api/v0/sync_session/$sync_session_id/user/role" user_id="$target_user_id" role="$role"; then
+				    echo "Failed to set user role"
+				    continue
+				fi
+
+				echo "Set user role"
+				echo "Response:"
+				echo "$body" | pretty_json
+				;;
+			 *)
+				echo "Invalid resource \"$resource\""
+				echo "Only sync_session.metadata, sync_session.playback, user, and user.role resources are supported"
+				continue
+				;;
+		  esac
+		  ;;
+	   redis)
+		  CONTAINER_CLI=$container_cli "$prog_dir/redis" cli "${tokens[@]:1}"
+		  ;;
+	   ws)
+		  if [ -z "$sync_session_id" ]; then
+			 echo "No sync session in context"
+			 continue
+		  fi
+
+		  ws_uri="ws://$api_url/api/v0/sync_session/$sync_session_id/changes"
+		  
+		  echo "WS $ws_uri"
+		  echo "(Press CTRL+C to exit WS)"
+		  
+		  if ! websocat "$ws_uri"; then
+			 echo "Failed to open sync session changes web socket"
+			 continue
+		  fi
+		  ;;
+	   get_contexts)
+		  resource_arg="${tokens[1]}"
+		  resources=()
+
+		  if [ -n "$resource_arg" ]; then
+			 resources+=("$(canonicalize_resource $resource_arg)")
+		  else
+			 resources+=("sync_session" "user")
+		  fi
+
+		  after_first_resource_line=""
+		  for resource in "${resources[@]}"; do
+			 if [ -n "$after_first_resource_line" ]; then
+				echo
+			 fi
+			 after_first_resource_line="true"
+			 
+			 echo "$resource"
+			 echo "===="
+			 ctx_dir=""
+
+			 case "$resource" in
+				sync_session)
+				    ctx_dir="$wrk_dir/sync_session/"
+				    current_ctx="$sync_session_ctx"
+				    ;;
+				user)
+				    ctx_dir="$wrk_dir/user/"
+				    current_ctx="$user_ctx"
+				    ;;
+				*)
+				    echo "Invalid resource \"$resource\""
+				    continue
+				    ;;
+			 esac
+
+			 echo "  ID  VALUE                                 NOTES"
+			 
+			 while read -r id; do
+				if [ -z "$id" ]; then
+				    continue
+				fi
+				
+				if [[ "$current_ctx" == "$id" ]]; then
+				    current_marker="*"
+				else
+				    current_marker=" "
+				fi
+				
+				echo "$current_marker $id   $(cat $ctx_dir/$id/value)  $(cat $ctx_dir/$id/notes)"
+			 done <<<$(ls "$ctx_dir")
+		  done
+		  ;;
+	   use_context)
+		  resource=$(canonicalize_resource "${tokens[1]}")
+		  id="${tokens[2]}"
+
+		  if [ -z "$resource" ]; then
+			 echo "<resource> argument required"
+			 continue
+		  fi
+
+		  if [ -z "$id" ]; then
+			 echo "<id> argument required"
+			 continue
+		  fi
+
+		  ctx_dir=""
+		  case "$resource" in
+			 sync_session) ctx_dir="$wrk_dir/sync_session/$id" ;;
+			 user) ctx_dir="$wrk_dir/user/$id" ;;
+			 *)
+				echo "Invalid resource \"$resource\""
+				continue
+				;;
+		  esac
+
+		  if [ ! -d "$ctx_dir" ]; then
+			 echo "Context $resource/$id does not exist"
+			 continue
+		  fi
+
+		  case "$resource" in
+			 sync_session)
+				sync_session_ctx="$id"
+				sync_session_id=$(get_context sync_session "$id" value)
+				
+				set_default_context "sync_session" "$id"
+				
+				echo "Current sync session context: $sync_session_ctx"
+				echo "Sync session context notes  : $(get_context sync_session $sync_session_ctx notes)"
+				echo "Sync session ID             : $sync_session_id"
+				;;
+			 user)
+				user_ctx="$id"
+				user_id=$(get_context user "$id" value)
+				
+				set_default_context "user" "$id"
+				
+				echo "Current user context: $user_ctx"
+				echo "User context notes  : $(get_context user $user_ctx notes)"
+				echo "User ID             : $user_id"
+				;;
+			 *)
+				echo "Invalid resource \"$resource\""
+				continue
+				;;
+		  esac
+		  ;;
+	   clear_contexts)
+		  resource=$(canonicalize_resource "${tokens[1]}")
+		  id="${tokens[2]}"
+
+		  resources=()
+
+		  if [ -n "$resource" ]; then
+			 resources+=("$resource")
+		  fi
+
+		  ctx_dirs=()
+
+		  for resource in "${resources[@]}"; do
+			 case "$resource" in
+				sync_session) ctx_dirs+=("$wrk_dir/sync_session") ;;
+				user) ctx_dirs+=("$wrk_dir/user") ;;
+				'') ctx_dirs+=("$wrk_dir/sync_session" "$wrk_dir/user") ;;
+				*)
+				    echo "Invalid resource \"$resource\""
+				    continue
+				    ;;
+			 esac
+		  done
+
+		  for dir in "${ctx_dirs[@]}"; do
+			 to_delete="$dir"
+			 if [ -n "$id" ]; then
+				to_delete="$to_delete/$id"
+			 fi
+			 
+			 if ! mv "$to_delete" "$wrk_dir/trash"; then
+				echo "Failed to clear context(s)"
+				continue
+			 fi
+		  done
+
+		  ensure_wrk_dir
+
+		  echo "Cleared contexts: ${resources[@]}/$id"
+		  ;;
+	   set_config)
+		  key="${tokens[1]}"
+		  value="${tokens[2]}"
+
+		  if [ -z "$key" ]; then
+			 echo "<key> argument required"
+			 continue
+		  fi
+
+		  case "$key" in
+			 api_url) api_url="$value" ;;
+			 container_cli) container_cli="$value" ;;
+			 *) failure="true" ;;
+		  esac
+
+		  if [ -n "$failure" ]; then
+			 echo "Invalid key \"$key\""
+		  else
+			 set_config "$key" "$value"
+			 echo "Set $key=$value"
+		  fi
+		  ;;
+	   get_config)
+		  key="${tokens[1]}"
+
+		  if [ -z "$key" ]; then
+			 echo "<key> argument required"
+			 continue
+		  fi
+
+		  case "$key" in
+			 api_url) value="$api_url" ;;
+			 container_cli) value="$container_cli" ;;
+			 *) failure="true" ;;
+		  esac
+
+		  if [ -n "$failure" ]; then
+			 echo "Invalid key \"$key\""
+		  else
+			 echo "$key=$value"
+		  fi
+		  ;;
+	   clean)
+		  rm -rf "$wrk_dir"
+		  sync_session_ctx=""
+		  sync_session_id=""
+		  user_ctx=""
+		  user_id=""
+		  ensure_wrk_dir
+		  ;;
+	   '?')
+		  command="${tokens[1]}"
+
+		  if [ -z "$command" ]; then
+			 help
+		  else
+			 filtered_commands_help "$command"
+		  fi
+		  ;;
+	   x)
+		  echo "Exiting"
+		  exit 0
+		  ;;
+	   *)
+		  echo "Invalid command: \"$command\""
+		  commands_help
+		  continue
+		  ;;
+    esac
+
+    echo
+    last_command_status="true"
+done
