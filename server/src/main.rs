@@ -67,7 +67,7 @@ struct RedisConnectionPool {
     blocked_callers: Rc<RwLock<u64>>,
 
     /// List of idle clients. 
-    idle_conns: Rc<RwLock<Vec<MultiplexedConnection>>>,
+    idle_conns: Rc<RwLock<Vec<Rc<MultiplexedConnection>>>>,
 
     /// Stores an error which might occur while returning a connection to the
     /// pool. If this is not None then the pool is considered poisoned and cannot
@@ -136,7 +136,7 @@ impl RedisConnectionPool {
     /// Builds a new RedisConnectionLease.
     fn build_conn_lease<'a>(
         &'a self,
-        conn: &'a MultiplexedConnection
+        conn: Rc<MultiplexedConnection>
     ) -> RedisConnectionLease<'a>
     {
         RedisConnectionLease::new(self, conn)
@@ -167,7 +167,7 @@ impl RedisConnectionPool {
                 let mut leased_conns = self.leased_conns.write()?;
                 *leased_conns += 1;
 
-                return Ok(self.build_conn_lease(&conn))
+                return Ok(self.build_conn_lease(conn));
             },
             None => (),
         };
@@ -182,7 +182,7 @@ impl RedisConnectionPool {
 
             let mut leased_conns = self.leased_conns.write()?;
             *leased_conns += 1;
-            return Ok(self.build_conn_lease(&conn));
+            return Ok(self.build_conn_lease(Rc::new(conn)));
         }
 
         // If out of idle connections and we can't build a new one, wait until
@@ -194,9 +194,9 @@ impl RedisConnectionPool {
 
     /// Returns a leased connection to the pool. Not called directly, but instead
     /// called by end_lease.
-    fn try_end_lease<'a>(
-        &'a self,
-        conn: &'a MultiplexedConnection
+    fn try_end_lease(
+        &self,
+        conn: Rc<MultiplexedConnection>
     ) -> Result<(), RedisPoolError>
     {
         // Record as returned from lease
@@ -209,7 +209,7 @@ impl RedisConnectionPool {
         let leased_conns_r = self.leased_conns.read()?;
         
         if (idle_conns_r.len() as u64) < (*leased_conns_r * 2) {
-            self.idle_conns.write()?.push(*conn);
+            self.idle_conns.write()?.push(conn);
         }
         
         // Otherwise let self.conn fall out of scope and be closed
@@ -221,7 +221,7 @@ impl RedisConnectionPool {
     /// If this method fails the connection pool is considered poisoned and cannot
     /// lease out any new connections. Due to the fact that failing corrupts the
     /// internal state of the pool.
-    fn end_lease<'a>(&'a self, conn: &'a MultiplexedConnection) {
+    fn end_lease(&self, conn: Rc<MultiplexedConnection>) {
         match self.try_end_lease(conn) {
             Err(e) => {
                 error!("Error while ending lease: {}", &e);
@@ -291,12 +291,12 @@ impl From<PoisonError<RwLockWriteGuard<'_, u64>>> for RedisPoolError {
 }
 
 impl
-    From<PoisonError<RwLockReadGuard<'_, Vec<MultiplexedConnection>>>>
+    From<PoisonError<RwLockReadGuard<'_, Vec<Rc<MultiplexedConnection>>>>>
     for RedisPoolError
 {
     /// Converts a Mutex lock error into a RedisPoolError.
     fn from(
-        e: PoisonError<RwLockReadGuard<'_, Vec<MultiplexedConnection>>>
+        e: PoisonError<RwLockReadGuard<'_, Vec<Rc<MultiplexedConnection>>>>
     ) -> Self
     {
         RedisPoolError{
@@ -306,12 +306,12 @@ impl
 }
 
 impl
-    From<PoisonError<RwLockWriteGuard<'_, Vec<MultiplexedConnection>>>>
+    From<PoisonError<RwLockWriteGuard<'_, Vec<Rc<MultiplexedConnection>>>>>
     for RedisPoolError
 {
     /// Converts a Mutex lock error into a RedisPoolError.
     fn from(
-        e: PoisonError<RwLockWriteGuard<'_, Vec<MultiplexedConnection>>>
+        e: PoisonError<RwLockWriteGuard<'_, Vec<Rc<MultiplexedConnection>>>>
     ) -> Self
     {
         RedisPoolError{
@@ -335,14 +335,14 @@ struct RedisConnectionLease<'a> {
     pool: &'a RedisConnectionPool,
     
     /// Underlying connection.
-    conn: &'a MultiplexedConnection,
+    conn: Rc<MultiplexedConnection>,
 }
 
 impl <'a> RedisConnectionLease<'a> {
     /// Creates a new connection lease.
     fn new(
         pool: &'a RedisConnectionPool,
-        conn: &'a MultiplexedConnection,
+        conn: Rc<MultiplexedConnection>,
     ) -> RedisConnectionLease<'a>
     {
         RedisConnectionLease{
@@ -355,7 +355,7 @@ impl <'a> RedisConnectionLease<'a> {
 impl <'a> Drop for RedisConnectionLease<'a> {
     /// Returns the underyling connection to the connection pool.
     fn drop(&mut self) {
-        self.pool.end_lease(self.conn);
+        self.pool.end_lease(self.conn.clone());
     }
 }
 
