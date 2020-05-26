@@ -10,7 +10,7 @@ use actix_web::middleware::Logger;
 use actix_web::middleware::errhandlers::{ErrorHandlerResponse,ErrorHandlers};
 
 use redis::{RedisResult,AsyncCommands,FromRedisValue};
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionLike,MultiplexedConnection};
 
 #[macro_use] extern crate log;
 use env_logger::Env;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use chrono::Utc;
 
 use std::collections::HashMap;
-use std::sync::{Mutex,RwLock,RwLockReadGuard,RwLockWriteGuard,PoisonError};
+use std::sync::{Arc,Mutex,RwLock,RwLockReadGuard,RwLockWriteGuard,PoisonError};
 use std::marker::Sized;
 use std::ops::Drop;
 use std::convert::From;
@@ -26,6 +26,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::clone::Clone;
 use std::rc::Rc;
+use std::borrow::BorrowMut;
 
 /// Number of seconds sync session and user keys last in Redis. Set to 1 day.
 const REDIS_KEY_TTL: usize = 86400;
@@ -60,19 +61,19 @@ struct RedisConnectionPool {
     max_conns: u64,
 
     /// Number of connections which are currently leased.
-    leased_conns: Rc<RwLock<u64>>,
+    leased_conns: Arc<RwLock<u64>>,
 
     /// Number of callers which are waiting for a connection because the maximum
     /// number of connections has been reached.
-    blocked_callers: Rc<RwLock<u64>>,
+    blocked_callers: Arc<RwLock<u64>>,
 
     /// List of idle clients. 
-    idle_conns: Rc<RwLock<Vec<Rc<MultiplexedConnection>>>>,
+    idle_conns: Arc<RwLock<Vec<Arc<MultiplexedConnection>>>>,
 
     /// Stores an error which might occur while returning a connection to the
     /// pool. If this is not None then the pool is considered poisoned and cannot
     /// lease any new connections.
-    end_lease_err: Rc<RwLock<Option<RedisPoolError>>>,
+    end_lease_err: Arc<RwLock<Option<RedisPoolError>>>,
 }
 
 impl RedisConnectionPool {
@@ -97,10 +98,10 @@ impl RedisConnectionPool {
             redis_client: redis_client,
             admin_conn: admin_conn,
             max_conns: REDIS_POOL_START_MAX_CONNS,
-            leased_conns: Rc::new(RwLock::new(0)),
-            blocked_callers: Rc::new(RwLock::new(0)),
-            idle_conns: Rc::new(RwLock::new(Vec::new())),
-            end_lease_err: Rc::new(RwLock::new(None)),
+            leased_conns: Arc::new(RwLock::new(0)),
+            blocked_callers: Arc::new(RwLock::new(0)),
+            idle_conns: Arc::new(RwLock::new(Vec::new())),
+            end_lease_err: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -136,7 +137,7 @@ impl RedisConnectionPool {
     /// Builds a new RedisConnectionLease.
     fn build_conn_lease<'a>(
         &'a self,
-        conn: Rc<MultiplexedConnection>
+        conn: Arc<MultiplexedConnection>
     ) -> RedisConnectionLease<'a>
     {
         RedisConnectionLease::new(self, conn)
@@ -182,7 +183,7 @@ impl RedisConnectionPool {
 
             let mut leased_conns = self.leased_conns.write()?;
             *leased_conns += 1;
-            return Ok(self.build_conn_lease(Rc::new(conn)));
+            return Ok(self.build_conn_lease(Arc::new(conn)));
         }
 
         // If out of idle connections and we can't build a new one, wait until
@@ -196,7 +197,7 @@ impl RedisConnectionPool {
     /// called by end_lease.
     fn try_end_lease(
         &self,
-        conn: Rc<MultiplexedConnection>
+        conn: Arc<MultiplexedConnection>
     ) -> Result<(), RedisPoolError>
     {
         // Record as returned from lease
@@ -221,7 +222,7 @@ impl RedisConnectionPool {
     /// If this method fails the connection pool is considered poisoned and cannot
     /// lease out any new connections. Due to the fact that failing corrupts the
     /// internal state of the pool.
-    fn end_lease(&self, conn: Rc<MultiplexedConnection>) {
+    fn end_lease(&self, conn: Arc<MultiplexedConnection>) {
         match self.try_end_lease(conn) {
             Err(e) => {
                 error!("Error while ending lease: {}", &e);
@@ -291,12 +292,12 @@ impl From<PoisonError<RwLockWriteGuard<'_, u64>>> for RedisPoolError {
 }
 
 impl
-    From<PoisonError<RwLockReadGuard<'_, Vec<Rc<MultiplexedConnection>>>>>
+    From<PoisonError<RwLockReadGuard<'_, Vec<Arc<MultiplexedConnection>>>>>
     for RedisPoolError
 {
     /// Converts a Mutex lock error into a RedisPoolError.
     fn from(
-        e: PoisonError<RwLockReadGuard<'_, Vec<Rc<MultiplexedConnection>>>>
+        e: PoisonError<RwLockReadGuard<'_, Vec<Arc<MultiplexedConnection>>>>
     ) -> Self
     {
         RedisPoolError{
@@ -306,12 +307,12 @@ impl
 }
 
 impl
-    From<PoisonError<RwLockWriteGuard<'_, Vec<Rc<MultiplexedConnection>>>>>
+    From<PoisonError<RwLockWriteGuard<'_, Vec<Arc<MultiplexedConnection>>>>>
     for RedisPoolError
 {
     /// Converts a Mutex lock error into a RedisPoolError.
     fn from(
-        e: PoisonError<RwLockWriteGuard<'_, Vec<Rc<MultiplexedConnection>>>>
+        e: PoisonError<RwLockWriteGuard<'_, Vec<Arc<MultiplexedConnection>>>>
     ) -> Self
     {
         RedisPoolError{
@@ -335,14 +336,14 @@ struct RedisConnectionLease<'a> {
     pool: &'a RedisConnectionPool,
     
     /// Underlying connection.
-    conn: Rc<MultiplexedConnection>,
+    conn: Arc<MultiplexedConnection>,
 }
 
 impl <'a> RedisConnectionLease<'a> {
     /// Creates a new connection lease.
     fn new(
         pool: &'a RedisConnectionPool,
-        conn: Rc<MultiplexedConnection>,
+        conn: Arc<MultiplexedConnection>,
     ) -> RedisConnectionLease<'a>
     {
         RedisConnectionLease{
@@ -361,6 +362,9 @@ impl <'a> Drop for RedisConnectionLease<'a> {
 
 /// HTTP app state.
 struct AppState {
+    /// Redis connection pool.
+    redis_pool: RedisConnectionPool,
+    
     /// Asynchronous Redis connection.
     redis_conn: Mutex<MultiplexedConnection>,
 }
@@ -1872,12 +1876,34 @@ async fn main() -> std::io::Result<()> {
         Ok(v) => v,
     };
 
+    let redis_pool = match RedisConnectionPool::new("redis://127.0.0.1/").await {
+        Err(e) => return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to create Redis connection pool: {}", e))),
+        Ok(v) => v,
+    };
+
     info!("Connected to Redis");
 
     // Start HTTP server
     let app_state = web::Data::new(AppState{
+        redis_pool: redis_pool,
         redis_conn: Mutex::new(redis_conn),
     });
+
+    // Just testing redis connection pool, will delete later
+    let pool_conn = match redis_pool.get().await {
+        Err(e) => panic!("failed to get pool conn: {}", e),
+        Ok(v) => v,
+    };
+    
+    let ping_res: RedisResult<String> = redis::cmd("PING")
+        .query_async(pool_conn.conn.borrow_mut()).await;
+    if ping_res != Ok("PONG".to_string()) {
+        error!("Failed to ping during pool test");
+    } else{
+        debug!("Pool test success");
+    }
 
     // TODO: Make subscribe web socket
 
