@@ -36,14 +36,19 @@ const REDIS_POOL_START_MAX_CONNS: u64 = 100;
 
 /// Redis asynchronous connection pool.
 ///
+/// Cloning the pool creates a new handle to the same connection pool. All
+/// operations are thread safe.
+///
 /// ## Behavior
 ///
-/// - get() creates a new Redis connection or uses an idle one if available
+/// - get() creates a new Redis connection or uses an idle one if available.
 /// - get() asynchronously blocks if the maximum number of connections has
-///   been reached
+///   been reached.
 /// - get() returns a RedisConnectionLease which uses the Drop trait to return
-///   connections to an idle connection pool when they go out of scope
-/// - The idle connection pool holds at most twice the number of leased connections
+///   connections to an idle connection pool when they go out of scope.
+/// - If RedisConnectionLease::drop() fails the connection pool's state will be
+///   corrupted and can no longer be used. Similar to std::sync::Mutex.
+/// - The idle connection pool holds at most twice the number of leased connections.
 /// - TODO: If there are 10 callers of get() waiting for a connection because the number
 ///   of maximum connections has been reached the pool will query Redis to see if it
 ///   can afford to increase the maximum number of connections
