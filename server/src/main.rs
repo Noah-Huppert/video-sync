@@ -1,10 +1,10 @@
 use std::fs;
 use std::io;
-use std::fmt;
 use std::convert::From;
 
-use serde_derive::Deserialize;
+use serde_derive::{Serialize, Deserialize};
 use toml;
+use warp;
 use warp::Filter;
 
 /// Application configuration.
@@ -65,10 +65,53 @@ impl From<ConfigError> for AppError {
     }
 }
 
+/// HTTP API server.
+struct APIServer {
+    /// Application configuration
+    cfg: Config,
+}
+
+/// API error.
+enum APIError {
+}
+
+/// Health endpoint response.
+#[derive(Serialize)]
+struct APIHealthResp {
+    ok: bool,
+}
+
+impl APIServer {
+    /// Constructs an API server.
+    fn new(cfg: Config) -> APIServer {
+        APIServer{
+            cfg: cfg,
+        }
+    }
+    
+    /// Constructs a Warp filter with all the API endpints setup.
+    fn get_routes(&self) -> impl warp::Filter<Extract = impl warp::Reply,Error = warp::Rejection> {
+        
+    }
+
+    /// Health check endpoint.
+    async fn health_endpoint(&self) -> Result<impl warp::Reply, APIError> {
+        Ok(pwarp::reply::json(&APIHealthResp{
+            ok: true,
+        }))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     // Load configuration
     let cfg = Config::load_from_file("./config.toml")?;
 
+    // Run server
+    let api = APIServer::new(cfg);
+    let routes = api.get_routes();
+
+    warp::serve(routes).run(([172, 0, 0, 1], cfg.server.port)).await;
+    
     Ok(())
 }
