@@ -1,0 +1,4 @@
+{
+    "port": 8000,
+    "mongoURI": "mongodb://devvideosync:devvideosync@127.0.0.1:27017/dev-video-sync"
+}

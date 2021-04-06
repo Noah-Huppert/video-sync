@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  mongo:
+    image: redis:latest
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: devvideosync
+      MONGO_INITDB_ROOT_PASSWORD: devvideosync
+      MONGO_INITDB_DATABASE: dev-video-sync
+    ports:
+      - "27017-9:27017-9"
+
+

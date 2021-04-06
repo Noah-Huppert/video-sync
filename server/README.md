@@ -15,12 +15,8 @@ synchronize them.
 Start Redis and MongoDB containers:
 
 ```sh
-./redis start
-./mongodb start
+docker-compose up -d
 ```
-
-[Podman](https://podman.io) is used by default, to customize change the 
-`CONTAINER_CLI` environment variable.
 
 Start the server:
 
