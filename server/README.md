@@ -6,13 +6,12 @@ Sync server.
 - [Development](#development)
 
 # Overview
-Receives state from client browser extensions and sends commands to 
-synchronize them. 
+Receives state from client browser extensions and sends commands to synchronize them. 
 
 # Development
 [Deno JS](https://deno.land) is used.
 
-Start Redis and MongoDB containers:
+Start a MongoDB container:
 
 ```sh
 docker-compose up -d
@@ -21,5 +20,5 @@ docker-compose up -d
 Start the server:
 
 ```sh
-deno run main.ts
+make
 ```
